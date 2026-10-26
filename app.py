@@ -2,7 +2,13 @@ import os
 import numpy as np
 from flask import Flask, render_template, request, jsonify
 
-from main import carregar_dados, preparar_dados
+from main import (
+    carregar_dados,
+    preparar_dados,
+    calcular_class_weight,
+    encontrar_threshold_otimo,
+    dividir_treino_teste,
+)
 from rede_neural import RedeNeural
 
 
@@ -18,11 +24,7 @@ def carregar_e_processar(caminho_arquivo):
     if len(X) < 30:
         raise ValueError(f"Poucos exemplos disponíveis para treinar a rede. São necessários pelo menos 30 dias com dados completos. CSV tem apenas {len(X)} exemplos.")
 
-    limite = int(len(X) * 0.8)
-    X_treino = X[:limite]
-    X_teste = X[limite:]
-    y_treino = y[:limite]
-    y_teste = y[limite:]
+    X_treino, y_treino, X_teste, y_teste = dividir_treino_teste(X, y, proporcao_treino=0.8)
     media = X_treino.mean()
     desvio = X_treino.std()
     if desvio == 0: desvio = 1
@@ -30,9 +32,15 @@ def carregar_e_processar(caminho_arquivo):
     X_teste_n = (X_teste - media) / desvio
 
     rede = RedeNeural(entradas=3, ocultos=4, taxa_aprendizado=0.01)
-    rede.treinar(X_treino_n, y_treino, epocas=2000)
+    class_weight = calcular_class_weight(y_treino)
+    rede.treinar(X_treino_n, y_treino, epocas=2000, class_weight=class_weight)
+
     probabilidades = rede.prever(X_teste_n)
-    previsoes = (probabilidades >= 0.5).astype(int)
+
+    # Calibra threshold para maximizar F1 na classe chuva (treino).
+    probabilidades_treino = rede.prever(X_treino_n)
+    threshold = encontrar_threshold_otimo(probabilidades_treino, y_treino)
+    previsoes = (probabilidades >= threshold).astype(int)
 
     vp = int(np.sum((y_teste == 1) & (previsoes == 1)))
     fp = int(np.sum((y_teste == 0) & (previsoes == 1)))
@@ -59,6 +67,8 @@ def carregar_e_processar(caminho_arquivo):
         "previsoes_sem_chuva": int(len(previsoes) - previsoes.sum()),
         "prob_min": round(float(probabilidades.min()), 4),
         "prob_max": round(float(probabilidades.max()), 4),
+        "threshold": round(float(threshold), 4),
+        "class_weight_chuva": round(float(class_weight[1]), 4),
     }
 
 @app.route("/")

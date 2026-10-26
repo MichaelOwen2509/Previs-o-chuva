@@ -128,6 +128,84 @@ def carregar_dados(caminho_arquivo):
     return chuva
 
 
+def calcular_class_weight(y):
+    """Calcula pesos inversamente proporcionais à frequência de cada classe."""
+    y = np.asarray(y).reshape(-1)
+    n_total = len(y)
+    n_chuva = int(np.sum(y == 1))
+    n_sem_chuva = int(np.sum(y == 0))
+
+    w1 = n_total / (2 * n_chuva) if n_chuva > 0 else 1.0
+    w0 = n_total / (2 * n_sem_chuva) if n_sem_chuva > 0 else 1.0
+
+    return {0: w0, 1: w1}
+
+
+def encontrar_threshold_otimo(probabilidades, y_true, passo=0.01, t_min=0.15, t_max=0.65):
+    """Escolhe o threshold que maximiza o F1-score para a classe chuva.
+
+    A busca fica restrita a [t_min, t_max] para evitar thresholds
+    excessivamente conservadores (que nunca preveem chuva).
+    """
+    y_true = np.asarray(y_true).reshape(-1)
+    probabilidades = np.asarray(probabilidades).reshape(-1)
+
+    melhor_threshold = (t_min + t_max) / 2
+    melhor_f1 = -1.0
+
+    for t in np.arange(t_min, t_max + passo, passo):
+        previsoes_t = (probabilidades >= t).astype(int)
+
+        vp = int(np.sum((y_true == 1) & (previsoes_t == 1)))
+        fp = int(np.sum((y_true == 0) & (previsoes_t == 1)))
+        fn = int(np.sum((y_true == 1) & (previsoes_t == 0)))
+
+        precisao_t = vp / (vp + fp) if vp + fp > 0 else 0.0
+        recall_t = vp / (vp + fn) if vp + fn > 0 else 0.0
+
+        f1 = (
+            2 * precisao_t * recall_t / (precisao_t + recall_t)
+            if precisao_t + recall_t > 0 else 0.0
+        )
+
+        if f1 > melhor_f1:
+            melhor_f1 = f1
+            melhor_threshold = float(t)
+
+    return melhor_threshold
+
+
+def dividir_treino_teste(X, y, proporcao_treino=0.8):
+    """Divide X e y garantindo que ambas as classes apareçam em treino e teste.
+
+    Faz split estratificado simples: separa índices de cada classe e divide
+    cada um na proporção informada, evitando que o teste fique sem exemplos
+    da classe minoritária (chuva).
+    """
+    X = np.asarray(X)
+    y = np.asarray(y).reshape(-1)
+
+    idx_chuva = np.where(y == 1)[0]
+    idx_sem_chuva = np.where(y == 0)[0]
+
+    n_chuva_treino = max(1, int(len(idx_chuva) * proporcao_treino))
+    n_sem_treino = max(1, int(len(idx_sem_chuva) * proporcao_treino))
+
+    # Garante que reste pelo menos 1 exemplo de cada classe para o teste.
+    n_chuva_treino = min(n_chuva_treino, len(idx_chuva) - 1) if len(idx_chuva) > 1 else len(idx_chuva)
+    n_sem_treino = min(n_sem_treino, len(idx_sem_chuva) - 1) if len(idx_sem_chuva) > 1 else len(idx_sem_chuva)
+
+    idx_treino = np.concatenate([idx_chuva[:n_chuva_treino], idx_sem_chuva[:n_sem_treino]])
+    idx_teste = np.concatenate([idx_chuva[n_chuva_treino:], idx_sem_chuva[n_sem_treino:]])
+
+    # Embaralha dentro de cada conjunto para não deixar todas as chamas juntas.
+    np.random.seed(42)
+    np.random.shuffle(idx_treino)
+    np.random.shuffle(idx_teste)
+
+    return X[idx_treino], y[idx_treino].reshape(-1, 1), X[idx_teste], y[idx_teste].reshape(-1, 1)
+
+
 def preparar_dados(chuva):
     valores = chuva.to_numpy(dtype=float)
 
@@ -166,14 +244,8 @@ def main(verbose=True):
             "Poucos exemplos disponíveis para treinar a rede."
         )
 
-    # Separa os dados em ordem cronológica.
-    limite = int(len(X) * 0.8)
-
-    X_treino = X[:limite]
-    y_treino = y[:limite]
-
-    X_teste = X[limite:]
-    y_teste = y[limite:]
+    # Separa treino/teste garantindo representação de ambas as classes.
+    X_treino, y_treino, X_teste, y_teste = dividir_treino_teste(X, y, proporcao_treino=0.8)
 
     # Normaliza os valores usando apenas os dados de treinamento.
     media = X_treino.mean()
@@ -196,13 +268,22 @@ def main(verbose=True):
     print(f"Exemplos para treinamento: {len(X_treino)}")
     print(f"Exemplos para teste: {len(X_teste)}")
 
+    # Peso das classes para combater desbalanceamento (chuva é raridade).
+    class_weight = calcular_class_weight(y_treino)
+    print(f"Pesos das classes (treino): sem chuva={class_weight[0]:.3f}, chuva={class_weight[1]:.3f}")
+
     print("\nIniciando treinamento...")
-    rede.treinar(X_treino, y_treino, epocas=2000)
+    rede.treinar(X_treino, y_treino, epocas=2000, class_weight=class_weight)
 
     # Faz previsões com os dados de teste.
     probabilidades = rede.prever(X_teste)
 
-    previsoes = (probabilidades >= 0.5).astype(int)
+    # Calibra o threshold para maximizar F1 na classe chuva (treino).
+    probabilidades_treino = rede.prever(X_treino)
+    threshold = encontrar_threshold_otimo(probabilidades_treino, y_treino)
+    print(f"Threshold calibrado (F1 no treino): {threshold:.3f}")
+
+    previsoes = (probabilidades >= threshold).astype(int)
 
     acuracia = np.mean(previsoes == y_teste)
 

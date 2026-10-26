@@ -17,8 +17,15 @@ class RedeNeural:
         x = np.clip(x, -500, 500)
         return 1 / (1 + np.exp(-x))
 
-    def treinar(self, X, y, epocas=2000):
+    def treinar(self, X, y, epocas=2000, class_weight=None):
         quantidade = len(X)
+
+        # Pesos por amostra para tratar desbalanceamento de classes.
+        pesos_amostra = None
+        if class_weight is not None:
+            w0 = float(class_weight.get(0, 1.0))
+            w1 = float(class_weight.get(1, 1.0))
+            pesos_amostra = np.where(y.reshape(-1) == 1, w1, w0).reshape(-1, 1)
 
         for epoca in range(epocas):
             # Propagação para frente
@@ -28,8 +35,10 @@ class RedeNeural:
             z2 = a1 @ self.pesos2 + self.bias2
             previsao = self.sigmoid(z2)
 
-            # Erro entre previsão e resultado real
+            # Erro entre previsão e resultado real (ponderado por classe).
             erro = previsao - y
+            if pesos_amostra is not None:
+                erro = erro * pesos_amostra
 
             # Retropropagação: ajuste dos parâmetros
             grad_pesos2 = a1.T @ erro / quantidade
