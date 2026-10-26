@@ -1,0 +1,128 @@
+# Rede Neural para Previsão de Chuva
+
+Projeto que treina uma rede neural simples para prever se vai chover no dia seguinte
+baseado nas precipitações dos 3 dias anteriores.
+
+## Funcionamento básico
+
+O processo segue estes passos:
+
+1. **Carregamento de dados**: Lê um arquivo CSV do INMET (Instituto Nacional de Meteorologia)
+   contendo dados climáticos horários. O código detecta automaticamente a codificação
+   (UTF-8, Latin-1, CP1252) e encontra as colunas de data e precipitação mesmo que os
+   nomes variem (acentuação, maiúsculas/minúsculas).
+
+2. **Processamento dos dados**:
+   - Filtra apenas dias com os 24 registros horários preenchidos
+   - Agrupa por dia, somando a precipitação total
+   - Seleciona a maior sequência de dias consecutivos sem interrupções
+   - Cria pares (X, y) onde X são os 3 dias anteriores de precipitação e y indica
+     se choveu no dia seguinte (1 = chuva, 0 = sem chuva)
+
+3. **Divisão treino/teste**: 80% dos dados para treinamento, 20% para teste (manter a
+   ordem cronológica).
+
+4. **Normalização**: Normaliza os dados de treinamento e aplica o mesmo desvio padrão
+   aos dados de teste (sem vazar informações do teste).
+
+5. **Treino da rede neural**: Uma rede neural com:
+   - 3 entradas (3 dias anteriores)
+   - 4 neurônios na camada oculta
+   - Função de ativação tanh na oculta, sigmoid na saída
+   - 2000 épocas com taxa de aprendizado 0.01
+   - Backpropagation com cálculo de gradiente
+
+6. **Avaliação**: Mostra acurácia da rede vs uma referência (mais comum no treino),
+   mais métricas como precisão e recall para a classe "chuva".
+
+## Como usar
+
+### Pré-requisitos
+
+- Python 3.8+
+- Bibliotecas: numpy, pandas (instale via `pip install -r requirements.txt`)
+
+### Executando
+
+Passe o caminho do arquivo CSV como argumento:
+
+```bash
+python main.py data/inmet.csv
+```
+
+ou ativando o ambiente virtual:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+python main.py data/inmet.csv
+```
+
+### Interface web
+
+```powershell
+.\venv\Scripts\python.exe app.py
+```
+
+Depois abra http://127.0.0.1:8000
+
+O arquivo CSV deve seguir o padrão do INMET (linhas de metadado de 8 primeiras linhas,
+seguidas de cabeçalho com colunas separadas por ponto e vírgula `;`).
+
+### Saída esperada
+
+O programa imprime:
+
+- Dados preparados (primeiro/último dia, quantidade de dias consecutivos)
+- Evolução do erro durante o treino (a cada 500 épocas)
+- Acurácia da rede neural e da referência (strategy simples)
+- Diagnóstico: dias com chuva/teste, previsões feitas
+- Métricas: precisão e recall para a classe chuva
+- Exemplos individuais de previsão (real vs previsto + probabilidade)
+
+## Exemplos de saída
+
+```
+Dados meteorológicos preparados:
+Primeiro dia: 2026-01-09
+Último dia:   2026-09-30
+Dias consecutivos completos: 265
+
+Total de exemplos: 262
+Exemplos para treinamento: 209
+Exemplos para teste: 53
+
+Iniciando treinamento...
+Época 500: erro = 0.5615
+Época 1000: erro = 0.5245
+Época 1500: erro = 0.5077
+Época 2000: erro = 0.4978
+
+===== RESULTADOS =====
+Acurácia da rede neural: 88.7%
+Acurácia da referência:  84.9%
+
+===== METRICAS DE CHUVA =====
+Acertos de chuva: 2
+Alarmes falsos de chuva: 0
+Dias chuvosos não identificados: 6
+Acertos de dias sem chuva: 45
+Precisão: 100.0%
+Recall: 25.0%
+
+Últimos exemplos do teste:
+Real: Sem chuva  | Previsto: Sem chuva  | Probabilidade estimada de chuva: 20.3%
+...
+```
+
+## Adaptando para outros arquivos
+
+O código foi projetado para funcionar com **qualquer** arquivo CSV do INMET sem
+necessidade de editar o arquivo. Ele:
+
+- Detecta automaticamente a codificação do arquivo (UTF-8, Latin-1, CP1252)
+- Normaliza os nomes das colunas (remove acentos, deixa maiúsculo) e busca por
+  palavras-chave: "DATA" para a coluna de data e "PRECIP" ou "CHUVA" para a
+  coluna de precipitação
+- Usa `skiprows=8` (padrão INMET: 8 linhas de metadado antes do cabeçalho)
+
+Basta apontar para qualquer arquivo CSV no padrão do INMET e o programa se adapta.

@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ titulo }}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { background: #f8f9fa; margin: 0; padding: 20px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .container { max-width: 1200px; }
+        .card { margin-bottom: 20px; border: none; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        .card-header { background: #e9ecef; border-bottom: 1px solid #dee2e6; }
+        .btn-action { padding: 8px 16px; font-size: 0.9rem; }
+        .spinner-grow-small { width: 1rem; height: 1rem; }
+        .nav-link { color: #495057; }
+        .file-preview { padding: 15px; background: #f8f9fa; border-radius: 4px; margin: 10px 0; }
+        .result-card { margin-top: 20px; }
+        .metric-value { font-size: 2rem; font-weight: bold; }
+        .improvement { color: #28a745; font-weight: bold; }
+        .message-toast { padding: 10px; border-radius: 4px; margin: 5px 0; }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg navbar-light bg-light mb-4">
+    <div class="container">
+        <a class="navbar-brand" href="#">
+            <i class="fas fa-tachometer-alt me-2"></i>Previsão de Chuva
+        </a>
+        <small class="text-muted">Rede Neural - Análise de Dados Climáticos</small>
+    </div>
+</nav>
+
+<div class="container">
+
+    <!-- ========== ÁREA DE MENSAGENS ========== -->
+    <div id="toast-container" class="mb-3" style="z-index: 1050;"></div>
+
+    <!-- ========== CARD DE UPLOAD ========== -->
+    <div class="card">
+        <div class="card-header">
+            <h5 class="mb-0"><i class="fas fa-upload me-2"></i> Upload de Arquivo CSV</h5>
+        </div>
+        <div class="card-body">
+            <p class="text-muted small">Arquivo deve seguir o padrão INMET (8 linhas de metadado + cabeçalho com sep. ;)</p>
+            <form id="upload-form" action="/analisar" method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="action" value="upload">
+                <div class="row g-3">
+                    <div class="col-12">
+                        <input class="form-control" type="file" name="csv_file" accept=".csv" required>
+                    </div>
+                    <div class="col-12">
+                        <button type="submit" class="btn btn-primary w-100">
+                            <i class="fas fa-arrow-up me-2"></i> Enviar e Analisar
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ========== LISTA DE ARQUIVOS EXISTENTES ========== -->
+    {% if arquivos %}
+    <div class="card">
+        <div class="card-header">
+            <h5 class="mb-0"><i class="fas fa-folder me-2"></i> Arquivos Salvos</h5>
+        </div>
+        <div class="card-body">
+            <p class="text-muted small">Clique em um arquivo para analisar rapidamente:</p>
+            <div class="list-group">
+                {% for arq in arquivos %}
+                <a href="#" class="list-group-item list-group-item-action file-item" data-filename="{{ arq }}">
+                    <div class="d-flex w-100 justify-content-between">
+                        <h6 class="mb-1">{{ arq }}</h6>
+                        <small class="text-muted">Analisar</small>
+                    </div>
+                </a>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- ========== ÁREA DE RESULTADOS ========== -->
+    <div id="results-area" class="card result-card" style="margin-top: 20px; display: none;">
+        <div class="card-header">
+            <h5 class="mb-0"><i class="fas fa-chart-bar me-2"></i> Resultados da Análise</h5>
+        </div>
+        <div class="card-body p-4">
+            <div class="row">
+                <div class="col-md-4">
+                    <div class="text-center">
+                        <div class="metric-value" id="acuracia">--</div>
+                        <div class="text-muted">Acurácia</div>
+                    </div>
+                    <div class="mt-3">
+                        <div class="metric-value" id="acuracia-base">--</div>
+                        <div class="text-muted">Base (referência)</div>
+                    </div>
+                    <div class="mt-3">
+                        <div class="improvement" id="melhoria">--</div>
+                        <small>Melhoria</small>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="text-center">
+                        <div class="metric-value" id="precisao">--</div>
+                        <div class="text-muted">Precisão</div>
+                    </div>
+                    <div class="mt-3">
+                        <div class="metric-value" id="recall">--</div>
+                        <div class="text-muted">Recall</div>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="text-center">
+                        <div class="metric-value" id="chuvas">0</div>
+                        <div class="text-muted">Chuvas no teste</div>
+                    </div>
+                    <div class="mt-3">
+                        <div class="metric-value" id="sem_chuva">0</div>
+                        <div class="text-muted">Sem chuva no teste</div>
+                    </div>
+                </div>
+            </div>
+            <hr class="my-4">
+            <p class="text-center" id="previsoes-text">--</p>
+            <div class="text-center">
+                <button id="nova-analise-btn" class="btn btn-secondary w-50">
+                    <i class="fas fa-redo me-2"></i> Nova Análise
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ========== ESTADO DE CARREGAMENTO ========== -->
+    <div id="loading-overlay" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255,255,255,0.8); z-index: 9999; justify-content: center; align-items: center;">
+        <div class="spinner-grow text-primary" role="status">
+            <span class="visually-hidden">Carregando...</span>
+        </div>
+        <p class="mt-3">Processando dados...</p>
+    </div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    // Inicializar container de toast
+    if (!document.getElementById('toast-container').innerHTML) {
+        document.getElementById('toast-container').innerHTML = `
+            <div id="liveToast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+                <div class="toast-header">
+                    <strong class="me-auto">Sistema</strong>
+                    <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
+                </div>
+                <div class="toast-body" id="toast-message">
+                    Mensagem inicial
+                </div>
+            </div>
+        `;
+    }
+
+    // Função para mostrar toast
+    function showToast(mensagem, tipo = 'info') {
+        const toastEl = document.getElementById('liveToast');
+        const toastBody = document.getElementById('toast-message');
+        toastBody.textContent = mensagem;
+        // Classes Bootstrap: success=text-bg-success, danger=text-bg-danger, info=text-bg-info
+        if (tipo === 'success') {
+            toastEl.className = 'toast text-bg-success';
+        } else if (tipo === 'danger') {
+            toastEl.className = 'toast text-bg-danger';
+        } else {
+            toastEl.className = 'toast text-bg-info';
+        }
+        const toast = new bootstrap.Toast(toastEl);
+        toast.show();
+    }
+
+    // Função para exibir área de resultados
+    function showResults(resultado) {
+        const resultsArea = document.getElementById('results-area');
+        const loadingOverlay = document.getElementById('loading-overlay');
+
+        if (!resultado) {
+            resultsArea.style.display = 'none';
+            loadingOverlay.style.display = 'none';
+            return;
+        }
+
+        const pct = v => (v * 100).toFixed(1) + '%';
+        document.getElementById('acuracia').textContent = pct(resultado.acuracia);
+        document.getElementById('acuracia-base').textContent = pct(resultado.acuracia_base);
+        document.getElementById('melhoria').textContent = pct(resultado.melhoria);
+        document.getElementById('precisao').textContent = pct(resultado.precisao);
+        document.getElementById('recall').textContent = pct(resultado.recall);
+        document.getElementById('chuvas').textContent = resultado.chuvas_teste;
+        document.getElementById('sem_chuva').textContent = resultado.sem_chuva_teste;
+        document.getElementById('previsoes-text').innerHTML = '<strong>Previsões:</strong> ' + resultado.previsoes_chuva + ' chuva | ' + resultado.previsoes_sem_chuva + ' sem chuva';
+
+        resultsArea.style.display = 'block';
+        loadingOverlay.style.display = 'none';
+    }
+
+    // Função para handler de formulário de upload
+    document.getElementById('upload-form').addEventListener('submit', async function(e) {
+        e.preventDefault();
+
+        // Mostrar loading
+        document.getElementById('loading-overlay').style.display = 'flex';
+        const submitBtn = e.target.querySelector('button');
+        const originalText = submitBtn.innerHTML;
+        submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i> Processando...';
+        submitBtn.disabled = true;
+
+        const formData = new FormData(this);
+
+        try {
+            const response = await fetch('/analisar', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await response.json();
+
+            // Esconder loading
+            document.getElementById('loading-overlay').style.display = 'none';
+            submitBtn.innerHTML = originalText;
+            submitBtn.disabled = false;
+
+            // Tratar resposta pelo campo 'tipo'
+            if (data.tipo === 'sucesso') {
+                showToast(data.mensagem, 'success');
+                // Se for upload, recarregar página após 2s para mostrar o novo arquivo
+                if (data.arquivo) {
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 2000);
+                }
+            } else if (data.tipo === 'erro') {
+                showToast(data.mensagem, 'danger');
+                // Limpar área de resultados em caso de erro
+                document.getElementById('results-area').style.display = 'none';
+            } else {
+                showToast('Resposta inesperada do servidor.', 'danger');
+            }
+        } catch (error) {
+            document.getElementById('loading-overlay').style.display = 'none';
+            showToast('Erro de comunicação com o servidor.', 'danger');
+            console.error('Error:', error);
+        }
+    });
+
+    // Handler para clicar em arquivo da lista
+    document.querySelectorAll('.file-item').forEach(item => {
+        item.addEventListener('click', function(e) {
+            e.preventDefault();
+            const filename = this.dataset.filename;
+
+            // Mostrar loading
+            document.getElementById('loading-overlay').style.display = 'flex';
+
+            const formData = new FormData();
+            formData.append('action', 'selecionar');
+            formData.append('arquivo', filename);
+
+            fetch('/analisar', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                // Esconder loading
+                document.getElementById('loading-overlay').style.display = 'none';
+
+                if (data.tipo === 'sucesso' && data.resultado) {
+                    showToast(data.mensagem, 'success');
+                    showResults(data.resultado);
+                } else if (data.tipo === 'erro') {
+                    showToast(data.mensagem, 'danger');
+                } else {
+                    showToast('Resposta inesperada do servidor.', 'danger');
+                }
+            })
+            .catch(error => {
+                document.getElementById('loading-overlay').style.display = 'none';
+                showToast('Erro de comunicação com o servidor.', 'danger');
+                console.error('Error:', error);
+            });
+        });
+    });
+
+    // Handler para botão "Nova Análise"
+    document.getElementById('nova-analise-btn').addEventListener('click', function() {
+        // Resetar formulário e esconder resultados
+        document.getElementById('upload-form').reset();
+        document.getElementById('results-area').style.display = 'none';
+        document.getElementById('loading-overlay').style.display = 'none';
+        // Limpar toast
+        const toastEl = document.getElementById('liveToast');
+        if (toastEl) {
+            const toast = bootstrap.Toast.getInstance(toastEl);
+            if (toast) toast.hide();
+        }
+    });
+</script>
+
+</body>
+</html>
