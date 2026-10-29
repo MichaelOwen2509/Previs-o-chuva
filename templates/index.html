@@ -134,6 +134,33 @@
         </div>
     </div>
 
+    <!-- ========== CARD DE PREVISÃO PRÓXIMO DIA ========== -->
+    <div id="previsao-proximo-dia" class="card result-card" style="margin-top: 20px; display: none;">
+        <div class="card-header bg-warning text-dark">
+            <h5 class="mb-0"><i class="fas fa-calendar-day me-2"></i> Previsão para o Próximo Dia</h5>
+        </div>
+        <div class="card-body p-4 text-center">
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="metric-value" id="prob-chuva" style="color: #666;">--%</div>
+                    <div class="text-muted small">Probabilidade de Chuva</div>
+                </div>
+                <div class="col-md-6">
+                    <div class="metric-value" id="previsao-texto" style="color: #666;">--</div>
+                    <div class="text-muted small">Previsão</div>
+                </div>
+            </div>
+            <div class="mt-3">
+                <small class="text-muted" id="ultima-data">Última data: --</small>
+            </div>
+            <div class="mt-3">
+                <button id="atualizar-previsao-btn" class="btn btn-outline-warning btn-sm">
+                    <i class="fas fa-sync-alt me-2"></i> Atualizar Previsão
+                </button>
+            </div>
+        </div>
+    </div>
+
     <!-- ========== ESTADO DE CARREGAMENTO ========== -->
     <div id="loading-overlay" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(255,255,255,0.8); z-index: 9999; justify-content: center; align-items: center;">
         <div class="spinner-grow text-primary" role="status">
@@ -229,11 +256,11 @@
             // Tratar resposta pelo campo 'tipo'
             if (data.tipo === 'sucesso') {
                 showToast(data.mensagem, 'success');
-                // Se for upload, recarregar página após 2s para mostrar o novo arquivo
+                // Se for upload, não recarregar mais; tentar previsão do próximo dia
                 if (data.arquivo) {
                     setTimeout(() => {
-                        window.location.reload();
-                    }, 2000);
+                        buscarPrevisaoProximoDia('data');
+                    }, 500);
                 }
             } else if (data.tipo === 'erro') {
                 showToast(data.mensagem, 'danger');
@@ -274,6 +301,10 @@
                 if (data.tipo === 'sucesso' && data.resultado) {
                     showToast(data.mensagem, 'success');
                     showResults(data.resultado);
+                    // Chamar previsão do próximo dia
+                    setTimeout(() => {
+                        buscarPrevisaoProximoDia(filename);
+                    }, 500);
                 } else if (data.tipo === 'erro') {
                     showToast(data.mensagem, 'danger');
                 } else {
@@ -293,6 +324,7 @@
         // Resetar formulário e esconder resultados
         document.getElementById('upload-form').reset();
         document.getElementById('results-area').style.display = 'none';
+        document.getElementById('previsao-proximo-dia').style.display = 'none';
         document.getElementById('loading-overlay').style.display = 'none';
         // Limpar toast
         const toastEl = document.getElementById('liveToast');
@@ -300,6 +332,48 @@
             const toast = bootstrap.Toast.getInstance(toastEl);
             if (toast) toast.hide();
         }
+    });
+
+    // Função para buscar previsão do próximo dia
+    async function buscarPrevisaoProximoDia(arquivo) {
+        try {
+            const response = await fetch('/prever?arquivo=' + encodeURIComponent(arquivo));
+            const data = await response.json();
+
+            if (data.tipo === 'sucesso' && data.resultado) {
+                const r = data.resultado;
+                const previsaoCard = document.getElementById('previsao-proximo-dia');
+                const probEl = document.getElementById('prob-chuva');
+                const textoEl = document.getElementById('previsao-texto');
+                const dataEl = document.getElementById('ultima-data');
+
+                probEl.textContent = r.probabilidade_percentual + '%';
+                textoEl.textContent = r.previsao_texto;
+                dataEl.textContent = 'Última data: ' + r.ultima_data_disponivel;
+
+                // Cores baseadas na previsão
+                if (r.previsao_chuva === 1) {
+                    probEl.style.color = '#dc3545'; // vermelho
+                    textoEl.style.color = '#dc3545';
+                    previsaoCard.querySelector('.card-header').className = 'card-header bg-danger text-white';
+                } else {
+                    probEl.style.color = '#198754'; // verde
+                    textoEl.style.color = '#198754';
+                    previsaoCard.querySelector('.card-header').className = 'card-header bg-success text-white';
+                }
+
+                previsaoCard.style.display = 'block';
+            } else {
+                console.warn('Previsão não disponível:', data.mensagem);
+            }
+        } catch (error) {
+            console.error('Erro ao buscar previsão:', error);
+        }
+    }
+
+    // Handler para botão de atualizar previsão
+    document.getElementById('atualizar-previsao-btn').addEventListener('click', function() {
+        buscarPrevisaoProximoDia('data');
     });
 </script>
 

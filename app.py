@@ -1,116 +1,47 @@
 import os
 import numpy as np
+import math
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify
 
 from main import (
+    carregar_todas_cidades_da_pasta,
     carregar_dados,
-    carregar_varias_cidades,
-    preparar_dados,
-    calcular_class_weight,
-    encontrar_threshold_otimo,
-    dividir_treino_teste,
+    treinar_rede_completa,
+    prever_proximo_dia,
 )
 from rede_neural import RedeNeural
+
+
+def _sanitize_json(obj):
+    """Substitui NaN e Inf por None para tornar o dicionário serializável em JSON."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, (np.floating, float)):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return float(obj)
+    if isinstance(obj, (np.integer, int)):
+        return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return _sanitize_json(obj.tolist())
+    return obj
 
 
 app = Flask(__name__)
 DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
-COLUNAS_EXTRA_PADRAO = [
-    "TEMPERATURA",
-    "UMIDADE",
-    "PRESSAO",
-    "RADIACAO",
-    "VENTO",
-]
-
-
-def _treinar_e_avaliar(df, epocas=5000):
-    """Executa preparo, treino e avaliação em um DataFrame (uma ou várias cidades)."""
-    X, y, colunas_feature = preparar_dados(df)
-
-    if len(X) < 30:
-        raise ValueError(
-            f"Poucos exemplos disponíveis para treinar a rede. São necessários pelo menos 30 dias com dados completos. Atualmente há {len(X)} exemplos."
-        )
-
-    X_treino, y_treino, X_teste, y_teste = dividir_treino_teste(X, y, proporcao_treino=0.8)
-
-    # Normaliza por coluna usando apenas treino.
-    media = X_treino.mean(axis=0)
-    desvio = X_treino.std(axis=0)
-    desvio = np.where(desvio == 0, 1, desvio)
-    X_treino_n = (X_treino - media) / desvio
-    X_teste_n = (X_teste - media) / desvio
-
-    n_entradas = X_treino_n.shape[1]
-    rede = RedeNeural(entradas=n_entradas, ocultos=8, taxa_aprendizado=0.01)
-    class_weight = calcular_class_weight(y_treino)
-    rede.treinar(X_treino_n, y_treino, epocas=epocas, class_weight=class_weight)
-
-    probabilidades = rede.prever(X_teste_n)
-    probabilidades_treino = rede.prever(X_treino_n)
-    threshold = encontrar_threshold_otimo(probabilidades_treino, y_treino)
-    previsoes = (probabilidades >= threshold).astype(int)
-
-    vp = int(np.sum((y_teste == 1) & (previsoes == 1)))
-    fp = int(np.sum((y_teste == 0) & (previsoes == 1)))
-    fn = int(np.sum((y_teste == 1) & (previsoes == 0)))
-    prec = vp / (vp + fp) if vp + fp > 0 else 0
-    recall = vp / (vp + fn) if vp + fn > 0 else 0
-    acuracia = float(np.mean(previsoes == y_teste))
-    classe_comum = int(np.mean(y_treino) >= 0.5)
-    ac_base_score = float(np.mean(np.full_like(y_teste, classe_comum) == y_teste))
-
-    return {
-        "total_exemplos": len(X),
-        "treino": len(X_treino),
-        "teste": len(X_teste),
-        "n_entradas": n_entradas,
-        "features": colunas_feature,
-        "acuracia": round(acuracia, 4),
-        "acuracia_base": round(ac_base_score, 4),
-        "melhoria": round(acuracia - ac_base_score, 4),
-        "precisao": round(prec, 4),
-        "recall": round(recall, 4),
-        "chuvas_teste": int(y_teste.sum()),
-        "sem_chuva_teste": int(len(y_teste) - y_teste.sum()),
-        "previsoes_chuva": int(previsoes.sum()),
-        "previsoes_sem_chuva": int(len(previsoes) - previsoes.sum()),
-        "prob_min": round(float(probabilidades.min()), 4),
-        "prob_max": round(float(probabilidades.max()), 4),
-        "threshold": round(float(threshold), 4),
-        "class_weight_chuva": round(float(class_weight[1]), 4),
-    }
-
-
-def carregar_e_processar(caminho_arquivo, colunas_extra=None):
-    """Processa um único CSV (compatível com o frontend existente)."""
-    if colunas_extra is None:
-        colunas_extra = COLUNAS_EXTRA_PADRAO
-
-    caminho = Path(caminho_arquivo)
-    if caminho.is_dir():
-        csvs = sorted(caminho.glob("*.csv"))
-        if not csvs:
-            raise ValueError(f"Nenhum CSV encontrado na pasta: {caminho}")
-        df = carregar_varias_cidades([str(c) for c in csvs], colunas_extra=colunas_extra)
-        resultado = _treinar_e_avaliar(df)
-        resultado["arquivo"] = "varias_cidades"
-        resultado["cidades"] = [Path(c).stem for c in csvs]
-        return resultado
-
-    df = carregar_dados(caminho, colunas_extra=colunas_extra)
-    resultado = _treinar_e_avaliar(df)
-    resultado["arquivo"] = os.path.basename(caminho_arquivo)
-    return resultado
 
 @app.route("/")
 def index():
-    arquivos = sorted(f for f in os.listdir(DATA_FOLDER) if f.endswith(".csv"))
+    arquivos = sorted(f for f in os.listdir(DATA_FOLDER) if f.lower().endswith(".csv"))
     return render_template("index.html", arquivos=arquivos, titulo="Previsão de Chuva - Rede Neural")
+
 
 @app.route("/analisar", methods=["POST"])
 def analisar():
@@ -121,7 +52,7 @@ def analisar():
             if not arquivo or arquivo.filename == "":
                 return jsonify({"tipo": "erro", "mensagem": "Nenhum arquivo enviado. Por favor, selecione um arquivo .csv."}), 400
             nome_seguro = "".join(c for c in arquivo.filename if c.isalnum() or c in "._-").lstrip(".")
-            if not nome_seguro.endswith(".csv") or nome_seguro == ".csv":
+            if not nome_seguro.lower().endswith(".csv") or nome_seguro == ".csv":
                 return jsonify({"tipo": "erro", "mensagem": "Formato inválido. Por favor, envie apenas arquivos .csv."}), 400
             caminho = os.path.join(DATA_FOLDER, nome_seguro)
             arquivo.save(caminho)
@@ -137,8 +68,12 @@ def analisar():
             if not os.path.exists(caminho):
                 return jsonify({"tipo": "erro", "mensagem": "Arquivo não encontrado. Ele pode ter sido excluído."}), 404
             try:
-                resultado = carregar_e_processar(caminho)
-                return jsonify({"tipo": "sucesso", "mensagem": "Análise concluída: " + nome, "resultado": resultado})
+                _, resultado, _ = treinar_rede_completa(
+                    caminho_dados=caminho,
+                    salvar_modelo='modelo.npz',
+                    verbose=False
+                )
+                return jsonify({"tipo": "sucesso", "mensagem": "Análise concluída: " + nome, "resultado": _sanitize_json(resultado)})
             except ValueError as ve:
                 return jsonify({"tipo": "erro", "mensagem": str(ve)}), 400
             except Exception as e:
@@ -164,11 +99,45 @@ def analisar():
     except Exception as e:
         return jsonify({"tipo": "erro", "mensagem": "Erro inesperado no servidor: " + str(e)}), 500
 
+
+@app.route("/prever", methods=["POST", "GET"])
+def prever():
+    try:
+        nome = None
+        if request.method == "POST":
+            nome = request.form.get("arquivo", "")
+        else:
+            nome = request.args.get("arquivo", "")
+
+        if not nome:
+            nome = DATA_FOLDER
+
+        # Garante caminho absoluto dentro de DATA_FOLDER
+        if not os.path.isabs(nome):
+            caminho_tentativo = os.path.join(DATA_FOLDER, nome)
+            if os.path.exists(caminho_tentativo):
+                nome = caminho_tentativo
+            else:
+                # Se nao existe, tenta direto o DATA_FOLDER (pasta com todos os CSVs)
+                nome = DATA_FOLDER
+
+        resultado = prever_proximo_dia(
+            caminho_modelo='modelo.npz',
+            caminho_dados=nome,
+        )
+        return jsonify({"tipo": "sucesso", "mensagem": "Previsão gerada", "resultado": _sanitize_json(resultado)})
+    except FileNotFoundError as fe:
+        return jsonify({"tipo": "erro", "mensagem": str(fe)}), 404
+    except ValueError as ve:
+        return jsonify({"tipo": "erro", "mensagem": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"tipo": "erro", "mensagem": "Erro interno ao gerar previsão: " + str(e)}), 500
+
+
 @app.route("/resultado")
 def resultado():
     return jsonify({"mensagem": "Acesse a página principal para iniciar uma nova análise."})
 
 
 if __name__ == "__main__":
-    # 5000 é reservada pelo Windows nesta máquina
     app.run(debug=True, port=8000)

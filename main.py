@@ -1,14 +1,16 @@
 import itertools
-import numpy as np
-import pandas as pd
+import os
 import sys
 import unicodedata
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
 from rede_neural import RedeNeural
 
 
 def normalizar_coluna(nome):
-    """Normaliza um nome de coluna: remove acentos, maiúsculo, strip."""
     nome = str(nome).strip().upper()
     nome = ''.join(
         c for c in unicodedata.normalize('NFD', nome)
@@ -18,7 +20,6 @@ def normalizar_coluna(nome):
 
 
 def detectar_encoding(caminho):
-    """Tenta várias codificações e retorna a primeira que funcionar."""
     for enc in ('utf-8', 'latin-1', 'cp1252', 'iso-8859-1'):
         try:
             with open(caminho, 'r', encoding=enc) as f:
@@ -30,7 +31,6 @@ def detectar_encoding(caminho):
 
 
 def _mapear_coluna(df, palavras):
-    """Encontra a primeira coluna que contenha alguma das palavras-chave."""
     for col in df.columns:
         for p in palavras:
             if p in col:
@@ -38,50 +38,32 @@ def _mapear_coluna(df, palavras):
     return None
 
 
-def _agregar_diario(df, coluna_data, coluna_chuva, colunas_extra=None):
-    """Agrega registros horários por dia, calculando media/soma das features."""
-    df = df.copy()
-    df[coluna_data] = pd.to_datetime(df[coluna_data], format="%Y/%m/%d", errors="coerce")
-    df = df.dropna(subset=[coluna_data])
+def _detectar_separador(caminho, encoding):
+    with open(caminho, encoding=encoding, errors='replace') as f:
+        cabecalho = next(itertools.islice(f, 8, None), "")
+    return ";" if ";" in cabecalho else ","
 
-    df["chuva"] = pd.to_numeric(
-        df[coluna_chuva].astype(str).str.strip().str.replace(",", ".", regex=False),
-        errors="coerce"
-    )
-    df.loc[df["chuva"] < 0, "chuva"] = np.nan
 
-    agg = {"chuva": ("chuva", "sum"), "horas_validas": ("chuva", "count")}
-
-    if colunas_extra:
-        for nome_col in colunas_extra:
-            df[nome_col] = pd.to_numeric(
-                df[nome_col].astype(str).str.strip().str.replace(",", ".", regex=False),
-                errors="coerce"
-            )
-            agg[f"{nome_col}_media"] = (nome_col, "mean")
-            agg[f"{nome_col}_max"] = (nome_col, "max")
-            agg[f"{nome_col}_min"] = (nome_col, "min")
-
-    diario = df.groupby(df[coluna_data].dt.normalize()).agg(**agg)
-    diario = diario[diario["horas_validas"] == 24]
-    diario = diario.sort_index()
-    return diario
+def _limpar_valor(valor):
+    if pd.isna(valor):
+        return np.nan
+    s = str(valor).strip()
+    if s == '' or s == '-9999' or s == '-9999.0':
+        return np.nan
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
 
 
 def carregar_dados(caminho_arquivo, colunas_extra=None):
-    """Carrega e processa dados meteorológicos de um CSV do INMET.
-    Retorna um DataFrame indexado por data com chuva_total e features opcionais.
-    Mantido para compatibilidade com app.py.
-    """
     caminho = Path(caminho_arquivo)
     if not caminho.exists():
         raise FileNotFoundError(f"Arquivo não encontrado: {caminho_arquivo}")
 
     encoding = detectar_encoding(caminho)
-
-    with open(caminho, encoding=encoding, errors="replace") as f:
-        cabecalho = next(itertools.islice(f, 8, None), "")
-    separador = ";" if ";" in cabecalho else ","
+    separador = _detectar_separador(caminho, encoding)
 
     df = pd.read_csv(
         caminho,
@@ -93,54 +75,70 @@ def carregar_dados(caminho_arquivo, colunas_extra=None):
     df.columns = [normalizar_coluna(c) for c in df.columns]
 
     coluna_data = _mapear_coluna(df, ("DATA",))
+    coluna_hora = _mapear_coluna(df, ("HORA", "HORARIO"))
     coluna_chuva = _mapear_coluna(df, ("PRECIP", "CHUVA"))
 
     if coluna_data is None or coluna_chuva is None:
         raise ValueError(
             "Não encontrei as colunas esperadas no CSV. "
-            f"Colunas encontradas (após normalização): {df.columns.tolist()}\n"
-            "Procuro por colunas que contenham 'DATA' (data) e 'PRECIP' ou 'CHUVA' (precipitação)."
+            f"Colunas encontradas: {df.columns.tolist()}\n"
+            "Procuro por 'DATA' e 'PRECIP' ou 'CHUVA'."
         )
 
-    if colunas_extra is None:
-        colunas_extra = []
+    df[coluna_chuva] = df[coluna_chuva].apply(_limpar_valor)
+    df.loc[df[coluna_chuva] < 0, coluna_chuva] = np.nan
+
+    if coluna_hora is not None:
+        df['_datetime'] = pd.to_datetime(
+            df[coluna_data].astype(str) + ' ' + df[coluna_hora].astype(str),
+            errors='coerce', utc=False
+        )
+    else:
+        df['_datetime'] = pd.to_datetime(df[coluna_data], errors='coerce', utc=False)
+
+    # Garante que todos fiquem sem fuso horário (tz-naive)
+    if hasattr(df['_datetime'].dt, 'tz') and df['_datetime'].dt.tz is not None:
+        df['_datetime'] = df['_datetime'].dt.tz_localize(None)
+
+    df = df.dropna(subset=['_datetime', coluna_chuva])
+    df = df.set_index('_datetime').sort_index()
+
     colunas_extra_encontradas = []
-    for palavra in colunas_extra:
-        col = _mapear_coluna(df, (palavra,))
-        if col is not None and col not in colunas_extra_encontradas:
-            colunas_extra_encontradas.append(col)
+    if colunas_extra:
+        for palavra in colunas_extra:
+            col = _mapear_coluna(df, (palavra,))
+            if col is not None and col not in colunas_extra_encontradas:
+                df[col] = df[col].apply(_limpar_valor)
+                colunas_extra_encontradas.append(col)
 
-    diario = _agregar_diario(df, coluna_data, coluna_chuva, colunas_extra_encontradas)
+    # Agrega por dia
+    agg = {coluna_chuva: (coluna_chuva, 'sum'), 'horas_validas': (coluna_chuva, 'count')}
+    for nome_col in colunas_extra_encontradas:
+        agg[f'{nome_col}_media'] = (nome_col, 'mean')
+        agg[f'{nome_col}_max'] = (nome_col, 'max')
+        agg[f'{nome_col}_min'] = (nome_col, 'min')
 
-    if len(diario) == 0:
-        raise ValueError("Nenhum dia com 24 registros válidos foi encontrado.")
+    diario = df.groupby(df.index.normalize()).agg(**agg)
+    diario = diario[diario['horas_validas'] == 24]
+    diario = diario.sort_index()
 
-    # Identifica sequências de dias consecutivos.
-    grupos = diario.index.to_series().diff().dt.days.ne(1).cumsum()
-    tamanhos = diario.groupby(grupos).size()
-    maior_grupo = tamanhos.idxmax()
-    diario = diario[grupos == maior_grupo]
-
-    print("\nDados meteorológicos preparados:")
-    print(f"Primeiro dia: {diario.index.min().date()}")
-    print(f"Último dia:   {diario.index.max().date()}")
-    print(f"Dias consecutivos completos: {len(diario)}")
+    # Identifica sequências de dias consecutivos
+    if len(diario) > 0:
+        grupos = diario.index.to_series().diff().dt.days.ne(1).cumsum()
+        tamanhos = diario.groupby(grupos).size()
+        maior_grupo = tamanhos.idxmax()
+        diario = diario[grupos == maior_grupo]
 
     return diario
 
 
 def carregar_varias_cidades(caminhos, colunas_extra=None):
-    """Carrega e agrega dados de múltiplos CSVs (várias cidades).
-
-    Cada arquivo vira uma 'cidade' identificada pelo nome do arquivo.
-    Os DataFrames são concatenados e ordenados por data.
-    """
     frames = []
     for caminho in caminhos:
         diario = carregar_dados(caminho, colunas_extra=colunas_extra)
         nome_cidade = Path(caminho).stem
         diario = diario.copy()
-        diario["cidade"] = nome_cidade
+        diario['cidade'] = nome_cidade
         frames.append(diario)
 
     if not frames:
@@ -151,8 +149,37 @@ def carregar_varias_cidades(caminhos, colunas_extra=None):
     return df
 
 
+def carregar_todas_cidades_da_pasta(pasta, colunas_extra=None, padrao="*.csv"):
+    pasta = Path(pasta)
+    if not pasta.exists():
+        raise FileNotFoundError(f"Pasta não encontrada: {pasta}")
+
+    arquivos = sorted(pasta.glob(padrao)) + sorted(pasta.glob(padrao.upper()))
+    
+    # Remove duplicatas por ano extraído do nome do arquivo
+    anos_vistos = set()
+    arquivos_unicos = []
+    for arq in arquivos:
+        nome = Path(arq).stem
+        # Extrai ano do nome (formato: INMET_CO_DF_A001_BRASILIA_01-01-YYYY_A_...)
+        partes = nome.split('_')
+        ano = None
+        for p in partes:
+            if p.isdigit() and len(p) == 4 and 1900 <= int(p) <= 2100:
+                ano = p
+                break
+        chave = ano or nome.lower()
+        if chave not in anos_vistos:
+            anos_vistos.add(chave)
+            arquivos_unicos.append(str(arq))
+
+    if not arquivos_unicos:
+        raise ValueError(f"Nenhum CSV encontrado em: {pasta}")
+
+    return carregar_varias_cidades(arquivos_unicos, colunas_extra=colunas_extra)
+
+
 def calcular_class_weight(y):
-    """Calcula pesos inversamente proporcionais à frequência de cada classe."""
     y = np.asarray(y).reshape(-1)
     n_total = len(y)
     n_chuva = int(np.sum(y == 1))
@@ -164,12 +191,7 @@ def calcular_class_weight(y):
     return {0: w0, 1: w1}
 
 
-def encontrar_threshold_otimo(probabilidades, y_true, passo=0.01, t_min=0.15, t_max=0.65):
-    """Escolhe o threshold que maximiza o F1-score para a classe chuva.
-
-    A busca fica restrita a [t_min, t_max] para evitar thresholds
-    excessivamente conservadores (que nunca preveem chuva).
-    """
+def encontrar_threshold_otimo(probabilidades, y_true, passo=0.01, t_min=0.50, t_max=0.95):
     y_true = np.asarray(y_true).reshape(-1)
     probabilidades = np.asarray(probabilidades).reshape(-1)
 
@@ -178,14 +200,12 @@ def encontrar_threshold_otimo(probabilidades, y_true, passo=0.01, t_min=0.15, t_
 
     for t in np.arange(t_min, t_max + passo, passo):
         previsoes_t = (probabilidades >= t).astype(int)
-
         vp = int(np.sum((y_true == 1) & (previsoes_t == 1)))
         fp = int(np.sum((y_true == 0) & (previsoes_t == 1)))
         fn = int(np.sum((y_true == 1) & (previsoes_t == 0)))
 
         precisao_t = vp / (vp + fp) if vp + fp > 0 else 0.0
         recall_t = vp / (vp + fn) if vp + fn > 0 else 0.0
-
         f1 = (
             2 * precisao_t * recall_t / (precisao_t + recall_t)
             if precisao_t + recall_t > 0 else 0.0
@@ -198,67 +218,110 @@ def encontrar_threshold_otimo(probabilidades, y_true, passo=0.01, t_min=0.15, t_
     return melhor_threshold
 
 
-def dividir_treino_teste(X, y, proporcao_treino=0.8):
-    """Divide X e y garantindo que ambas as classes apareçam em treino e teste.
+def calcular_auc(probabilidades, y_true):
+    """AUC via estatística de Mann-Whitney U (sem depender de sklearn)."""
+    probabilidades = np.asarray(probabilidades).reshape(-1)
+    y_true = np.asarray(y_true).reshape(-1)
 
-    Faz split estratificado simples: separa índices de cada classe e divide
-    cada um na proporção informada, evitando que o teste fique sem exemplos
-    da classe minoritária (chuva).
-    """
-    X = np.asarray(X)
-    y = np.asarray(y).reshape(-1)
+    pos = probabilidades[y_true == 1]
+    neg = probabilidades[y_true == 0]
 
-    idx_chuva = np.where(y == 1)[0]
-    idx_sem_chuva = np.where(y == 0)[0]
+    if len(pos) == 0 or len(neg) == 0:
+        return 0.5
 
-    n_chuva_treino = max(1, int(len(idx_chuva) * proporcao_treino))
-    n_sem_treino = max(1, int(len(idx_sem_chuva) * proporcao_treino))
-
-    # Garante que reste pelo menos 1 exemplo de cada classe para o teste.
-    n_chuva_treino = min(n_chuva_treino, len(idx_chuva) - 1) if len(idx_chuva) > 1 else len(idx_chuva)
-    n_sem_treino = min(n_sem_treino, len(idx_sem_chuva) - 1) if len(idx_sem_chuva) > 1 else len(idx_sem_chuva)
-
-    idx_treino = np.concatenate([idx_chuva[:n_chuva_treino], idx_sem_chuva[:n_sem_treino]])
-    idx_teste = np.concatenate([idx_chuva[n_chuva_treino:], idx_sem_chuva[n_sem_treino:]])
-
-    # Embaralha dentro de cada conjunto para não deixar todas as chamas juntas.
-    np.random.seed(42)
-    np.random.shuffle(idx_treino)
-    np.random.shuffle(idx_teste)
-
-    return X[idx_treino], y[idx_treino].reshape(-1, 1), X[idx_teste], y[idx_teste].reshape(-1, 1)
+    # Conta quantos pares (pos, neg) tem pos > neg
+    maior = 0.0
+    for p in pos:
+        maior += np.sum(p > neg) + 0.5 * np.sum(p == neg)
+    return float(maior / (len(pos) * len(neg)))
 
 
-def preparar_dados(df, coluna_chuva=None, janela_dias=3):
-    """Converte um DataFrame diário em X (features dos N dias anteriores) e y (chuva hoje).
+def calcular_brier(probabilidades, y_true):
+    """Brier score: erro quadrático médio das probabilidades."""
+    probabilidades = np.asarray(probabilidades).reshape(-1)
+    y_true = np.asarray(y_true).reshape(-1)
+    return float(np.mean((probabilidades - y_true) ** 2))
 
-    Se o DataFrame tiver coluna 'cidade', cada cidade é tratada como sequência
-    independente (não mistura o último dia de uma cidade com o primeiro da outra).
 
-    X tem formato (amostras, janela_dias * n_features).
-    """
-    df = df.sort_index()
+def engenharia_features_diaria(df, coluna_chuva=None):
+    df = df.copy().sort_index()
 
-    if coluna_chuva is None:
-        # Detecta automaticamente a coluna de chuva agregada (case-insensitive).
+    # Detecta coluna de chuva se não informada
+    if coluna_chuva is None or coluna_chuva not in df.columns:
         for c in df.columns:
-            if "CHUVA" in c.upper():
+            if 'CHUVA' in c.upper() or 'PRECIP' in c.upper():
                 coluna_chuva = c
                 break
     if coluna_chuva is None:
-        raise ValueError("Nenhuma coluna de chuva encontrada no DataFrame.")
+        raise ValueError("Nenhuma coluna de chuva/precipitação encontrada no DataFrame.")
+
+    # Preenche valores ausentes
+    colunas_numericas = df.select_dtypes(include=[np.number]).columns
+    df[colunas_numericas] = df[colunas_numericas].ffill().bfill()
+
+    # Chuva total diária
+    df['chuva_total'] = df[coluna_chuva]
+
+    # Features de chuva (as mais preditivas)
+    df['chuva_media_3d'] = df['chuva_total'].rolling(window=3, min_periods=1).mean()
+    df['chuva_media_7d'] = df['chuva_total'].rolling(window=7, min_periods=1).mean()
+
+    # Sequência de dias consecutivos sem chuva
+    df['dia_com_chuva'] = (df['chuva_total'] > 0).astype(int)
+    grupo = (df['dia_com_chuva'] != df['dia_com_chuva'].shift(1)).cumsum()
+    df['sequencia_dias_sem_chuva'] = df.groupby(grupo)['dia_com_chuva'].cumcount()
+    df.loc[df['dia_com_chuva'] == 1, 'sequencia_dias_sem_chuva'] = 0
+
+    # Sazonalidade (ciclo anual - fundamental para chuva em Brasília)
+    meses = df.index.month.values
+    dias_do_ano = df.index.day_of_year.values
+    df['seno_mes'] = np.sin(2 * np.pi * meses / 12)
+    df['cosseno_mes'] = np.cos(2 * np.pi * meses / 12)
+    df['seno_dia_ano'] = np.sin(2 * np.pi * dias_do_ano / 365)
+    df['cosseno_dia_ano'] = np.cos(2 * np.pi * dias_do_ano / 365)
+
+    # Temperatura e umidade (ajudam a identificar massa de ar)
+    col_temp = _mapear_coluna(df, ('TEMPERATURA DO AR',))
+    if col_temp is not None:
+        df['temp_media'] = df[col_temp]
+    col_temp_max = _mapear_coluna(df, ('TEMPERATURA MAXIMA',))
+    col_temp_min = _mapear_coluna(df, ('TEMPERATURA MINIMA',))
+    if col_temp_max is not None and col_temp_min is not None:
+        df['amplitude_termica'] = df[col_temp_max] - df[col_temp_min]
+
+    col_umid = _mapear_coluna(df, ('UMIDADE RELATIVA DO AR',))
+    if col_umid is not None:
+        df['umidade_media'] = df[col_umid]
+
+    # Pressão (queda de pressão costuma preceder chuva)
+    col_pressao = _mapear_coluna(df, ('PRESSAO ATMOSFERICA AO NIVEL',))
+    if col_pressao is not None:
+        df['pressao_media'] = df[col_pressao]
+        df['pressao_variacao'] = df[col_pressao].diff()
+
+    return df
+
+
+def preparar_dados(df, coluna_chuva=None, janela_dias=3):
+    df = engenharia_features_diaria(df, coluna_chuva=coluna_chuva)
+
+    if coluna_chuva is None:
+        for c in df.columns:
+            if c == 'chuva_total' or 'CHUVA' in c.upper():
+                coluna_chuva = c
+                break
+    if coluna_chuva is None:
+        coluna_chuva = 'chuva_total'
 
     valores_chuva = df[coluna_chuva].to_numpy(dtype=float)
 
-    # Colunas de features (tudo que não seja a coluna de chuva, horas_validas ou cidade)
     colunas_feature = [
         c for c in df.columns
-        if c not in (coluna_chuva, "horas_validas", "cidade")
+        if c not in (coluna_chuva, 'horas_validas', 'cidade', 'dia_com_chuva')
     ]
 
     n_features = len(colunas_feature)
     if n_features == 0:
-        # Fallback: apenas chuva dos dias anteriores (comportamento original).
         matriz = valores_chuva.reshape(-1, 1)
         n_features = 1
     else:
@@ -266,175 +329,337 @@ def preparar_dados(df, coluna_chuva=None, janela_dias=3):
 
     X = []
     y = []
-    cidades = df["cidade"].to_numpy() if "cidade" in df.columns else None
+    datas_y = []
+    cidades = df['cidade'].to_numpy() if 'cidade' in df.columns else None
 
     n = len(valores_chuva)
     for i in range(janela_dias, n):
-        # Não ultrapassa fronteira de cidade (se houver).
         if cidades is not None and cidades[i] != cidades[i - janela_dias]:
             continue
 
-        janela = matriz[i - janela_dias:i].reshape(-1)  # achata janela_dias x n_features
+        janela = matriz[i - janela_dias:i].reshape(-1)
         choveu = int(valores_chuva[i] > 0)
 
         X.append(janela)
         y.append(choveu)
+        datas_y.append(df.index[i])
 
     return (
         np.array(X, dtype=float),
         np.array(y, dtype=float).reshape(-1, 1),
         colunas_feature,
+        np.array(datas_y),
     )
 
 
-def main(verbose=True):
-    if len(sys.argv) < 2:
-        print("Uso: python main.py <caminho_csv_ou_pasta> [colunas_extra...]")
-        print("Exemplo: python main.py data/")
-        print("Exemplo com features: python main.py data/ TEMPERATURA UMIDADE PRESSAO")
-        sys.exit(1)
+def dividir_temporal(X, y, datas, proporcoes=(0.6, 0.2, 0.2)):
+    X = np.asarray(X)
+    y = np.asarray(y).reshape(-1)
+    datas = np.asarray(datas)
 
-    caminho = sys.argv[1]
-    colunas_extra = sys.argv[2:] if len(sys.argv) > 2 else []
+    n = len(X)
+    a = int(n * proporcoes[0])
+    b = a + int(n * proporcoes[1])
 
-    caminho = Path(caminho)
+    X_treino = X[:a]
+    y_treino = y[:a].reshape(-1, 1)
+    datas_treino = datas[:a]
 
-    if caminho.is_dir():
-        csvs = sorted(caminho.glob("*.csv"))
-        if not csvs:
-            raise ValueError(f"Nenhum CSV encontrado na pasta: {caminho}")
-        caminhos = [str(c) for c in csvs]
-        print(f"\nCarregando {len(caminhos)} arquivo(s) CSV de: {caminho}")
-        df = carregar_varias_cidades(caminhos, colunas_extra=colunas_extra)
-    elif caminho.is_file():
-        print(f"\nCarregando 1 arquivo CSV: {caminho}")
-        df = carregar_dados(caminho, colunas_extra=colunas_extra)
-    else:
-        raise FileNotFoundError(f"Caminho não encontrado: {caminho}")
+    X_val = X[a:b]
+    y_val = y[a:b].reshape(-1, 1)
+    datas_val = datas[a:b]
 
-    X, y, colunas_feature = preparar_dados(df)
+    X_teste = X[b:]
+    y_teste = y[b:].reshape(-1, 1)
+    datas_teste = datas[b:]
 
-    n_entradas = X.shape[1]
-    print(f"Features utilizadas ({len(colunas_feature)}): {colunas_feature}")
-    print(f"Entradas da rede (janela x features): {n_entradas}")
+    return (X_treino, y_treino, datas_treino,
+            X_val, y_val, datas_val,
+            X_teste, y_teste, datas_teste)
 
-    if len(X) < 30:
-        raise ValueError(
-            "Poucos exemplos disponíveis para treinar a rede."
-        )
 
-    # Separa treino/teste garantindo representação de ambas as classes.
-    X_treino, y_treino, X_teste, y_teste = dividir_treino_teste(X, y, proporcao_treino=0.8)
-
-    # Normaliza por coluna usando apenas os dados de treinamento.
+def normalizar_treino_teste(X_treino, X_val, X_teste):
     media = X_treino.mean(axis=0)
     desvio = X_treino.std(axis=0)
     desvio = np.where(desvio == 0, 1, desvio)
 
-    X_treino = (X_treino - media) / desvio
-    X_teste = (X_teste - media) / desvio
+    X_treino_n = (X_treino - media) / desvio
+    X_val_n = (X_val - media) / desvio
+    X_teste_n = (X_teste - media) / desvio
 
-    # Cria nossa rede neural com o número correto de entradas.
+    return X_treino_n, X_val_n, X_teste_n, media, desvio
+
+
+def treinar_rede_completa(caminho_dados, epocas=5000, janela_dias=3,
+                          colunas_extra=None, proporcoes=(0.6, 0.2, 0.2),
+                          salvar_modelo='modelo.npz', verbose=True):
+    if os.path.isdir(caminho_dados):
+        df = carregar_todas_cidades_da_pasta(caminho_dados, colunas_extra=colunas_extra)
+    else:
+        df = carregar_dados(caminho_dados, colunas_extra=colunas_extra)
+
+    if len(df) < 100:
+        raise ValueError(
+            f"Poucos dias disponíveis ({len(df)}). São necessários pelo menos 100 dias com dados completos."
+        )
+
+    df = engenharia_features_diaria(df)
+
+    X, y, colunas_feature, datas = preparar_dados(df, janela_dias=janela_dias)
+
+    if len(X) < 100:
+        raise ValueError(
+            f"Poucos exemplos para treinar ({len(X)}). São necessários pelo menos 100 exemplos."
+        )
+
+    (X_treino, y_treino, d_treino,
+     X_val, y_val, d_val,
+     X_teste, y_teste, d_teste) = dividir_temporal(X, y, datas, proporcoes=proporcoes)
+
+    X_treino_n, X_val_n, X_teste_n, media, desvio = normalizar_treino_teste(
+        X_treino, X_val, X_teste
+    )
+
+    n_entradas = X_treino_n.shape[1]
+
     rede = RedeNeural(
         entradas=n_entradas,
-        ocultos=8,
-        taxa_aprendizado=0.01
+        ocultos=[32, 16],
+        taxa_aprendizado=0.01,
+        l2_lambda=0.001
     )
 
-    print(f"\nTotal de exemplos: {len(X)}")
-    print(f"Exemplos para treinamento: {len(X_treino)}")
-    print(f"Exemplos para teste: {len(X_teste)}")
+    # Inicializa bias de saída com log-odds da taxa base de chuva
+    p_base = float(np.mean(y_treino))
+    p_base = np.clip(p_base, 1e-4, 1 - 1e-4)
+    rede.biases[-1][0, 0] = np.log(p_base / (1 - p_base))
 
-    # Peso das classes para combater desbalanceamento (chuva é raridade).
     class_weight = calcular_class_weight(y_treino)
-    print(f"Pesos das classes (treino): sem chuva={class_weight[0]:.3f}, chuva={class_weight[1]:.3f}")
+    # Amortece fortemente o class_weight para evitar colapso para prever tudo como chuva
+    class_weight = {k: 1.0 + (v - 1.0) * 0.2 for k, v in class_weight.items()}
 
-    print("\nIniciando treinamento...")
-    rede.treinar(X_treino, y_treino, epocas=5000, class_weight=class_weight)
+    rede.treinar(
+        X_treino_n, y_treino,
+        epocas=8000,
+        batch_size=128,
+        X_val=X_val_n,
+        y_val=y_val,
+        paciencia=3000,
+        decaimento_taxa=0.8,
+        class_weight=class_weight,
+        verbose=verbose,
+        metrica_espera='auc',
+        epocas_minimas=2000
+    )
 
-    # Faz previsões com os dados de teste.
-    probabilidades = rede.prever(X_teste)
+    probabilidades_val = rede.prever(X_val_n)
+    threshold = encontrar_threshold_otimo(probabilidades_val, y_val)
+    # Piso forte: nunca aceita threshold abaixo de 0.5
+    rede.threshold_otimo = max(threshold, 0.50)
 
-    # Calibra o threshold para maximizar F1 na classe chuva (treino).
-    probabilidades_treino = rede.prever(X_treino)
-    threshold = encontrar_threshold_otimo(probabilidades_treino, y_treino)
-    print(f"Threshold calibrado (F1 no treino): {threshold:.3f}")
+    probabilidades_teste = rede.prever(X_teste_n)
+    previsoes = (probabilidades_teste >= threshold).astype(int)
 
-    previsoes = (probabilidades >= threshold).astype(int)
+    vp = int(np.sum((y_teste == 1) & (previsoes == 1)))
+    fp = int(np.sum((y_teste == 0) & (previsoes == 1)))
+    fn = int(np.sum((y_teste == 1) & (previsoes == 0)))
+    vn = int(np.sum((y_teste == 0) & (previsoes == 0)))
 
-    acuracia = np.mean(previsoes == y_teste)
+    acuracia = float(np.mean(previsoes == y_teste))
+    precisao = vp / (vp + fp) if vp + fp > 0 else 0.0
+    recall = vp / (vp + fn) if vp + fn > 0 else 0.0
+    f1 = 2 * precisao * recall / (precisao + recall) if precisao + recall > 0 else 0.0
 
-    # Compara com uma estratégia simples de referência.
+    auc = calcular_auc(probabilidades_teste, y_teste)
+    brier = calcular_brier(probabilidades_teste, y_teste)
+
     classe_comum = int(np.mean(y_treino) >= 0.5)
-    previsao_base = np.full_like(y_teste, classe_comum)
-    acuracia_base = np.mean(previsao_base == y_teste)
+    ac_base = float(np.mean(np.full_like(y_teste, classe_comum) == y_teste))
 
-    # Métricas detalhadas
-    verdadeiros_positivos = int(np.sum((y_teste == 1) & (previsoes == 1)))
-    falsos_positivos = int(np.sum((y_teste == 0) & (previsoes == 1)))
-    falsos_negativos = int(np.sum((y_teste == 1) & (previsoes == 0)))
-    verdadeiros_negativos = int(np.sum((y_teste == 0) & (previsoes == 0)))
+    resultado = {
+        'total_dias': len(df),
+        'total_exemplos': len(X),
+        'treino': len(X_treino),
+        'validacao': len(X_val),
+        'teste': len(X_teste),
+        'n_entradas': n_entradas,
+        'features': colunas_feature,
+        'acuracia': round(acuracia, 4),
+        'acuracia_base': round(ac_base, 4),
+        'melhoria': round(acuracia - ac_base, 4),
+        'precisao': round(precisao, 4),
+        'recall': round(recall, 4),
+        'f1': round(f1, 4),
+        'auc': round(auc, 4),
+        'brier': round(brier, 4),
+        'chuvas_teste': int(y_teste.sum()),
+        'sem_chuva_teste': int(len(y_teste) - y_teste.sum()),
+        'previsoes_chuva': int(previsoes.sum()),
+        'previsoes_sem_chuva': int(len(previsoes) - previsoes.sum()),
+        'threshold': round(threshold, 4),
+        'class_weight_chuva': round(float(class_weight[1]), 4),
+        'periodo_treino': f"{d_treino[0]} a {d_treino[-1]}",
+        'periodo_val': f"{d_val[0]} a {d_val[-1]}",
+        'periodo_teste': f"{d_teste[0]} a {d_teste[-1]}",
+    }
 
-    precisao = (
-        verdadeiros_positivos / (verdadeiros_positivos + falsos_positivos)
-        if verdadeiros_positivos + falsos_positivos > 0 else 0
-    )
+    rede.media_treino = media
+    rede.desvio_treino = desvio
+    rede.colunas_feature = colunas_feature
+    rede.colunas_extra = colunas_extra
+    rede.janela_dias = janela_dias
 
-    recall = (
-        verdadeiros_positivos / (verdadeiros_positivos + falsos_negativos)
-        if verdadeiros_positivos + falsos_negativos > 0 else 0
-    )
+    if salvar_modelo:
+        rede.salvar(salvar_modelo)
 
-    # --- RESUMO EXECUTIVO ---
-    print("\n" + "="*50)
-    print("       RESUMO EXECUTIVO")
-    print("="*50)
-    print(f"Acurácia da rede neural: {acuracia:.1%}")
-    print(f"Acurácia da referência (classe mais comum): {acuracia_base:.1%}")
-    print(f"Melhoria sobre referência: {(acuracia - acuracia_base):.1%}")
-    print()
-    print("Métricas de classificação:")
-    print(f"  Precisão (quando diz chuva, acerta?): {precisao:.1%}")
-    print(f"   Recall (dias chuvosos identificados): {recall:.1%}")
-    print()
-    print("Distribuição de classes no teste:")
-    print(f"  Dias com chuva no teste:      {int(y_teste.sum())}")
-    print(f"  Dias sem chuva no teste:      {int(len(y_teste) - y_teste.sum())}")
-    print(f"  Previsões de chuva:           {int(previsoes.sum())}")
-    print(f"  Previsões sem chuva:          {int(len(previsoes) - previsoes.sum())}")
-    print("="*50 + "\n")
-
-    # --- MÉTRICAS DETALHADAS DE CHUVA ---
-    print("===== METRICAS DE CHUVA =====")
-    print(f"Acertos de chuva:                      {verdadeiros_positivos}")
-    print(f"Alarmes falsos de chuva:               {falsos_positivos}")
-    print(f"Dias chuvosos nao identificados:       {falsos_negativos}")
-    print(f"Acertos de dias sem chuva:             {verdadeiros_negativos}")
-    print(f"Precisao:                              {precisao:.1%}")
-    print(f"Recall:                                {recall:.1%}")
-
-    # --- ÚLTIMOS EXEMPLOS DO TESTE (apenas se verbose=True) ---
     if verbose:
-        print("\nÚltimos exemplos do teste:")
+        print("\n" + "=" * 50)
+        print("       RESUMO EXECUTIVO")
+        print("=" * 50)
+        print(f"Período treino: {resultado['periodo_treino']}")
+        print(f"Período validação: {resultado['periodo_val']}")
+        print(f"Período teste: {resultado['periodo_teste']}")
+        print(f"Acurácia da rede neural: {acuracia:.1%}")
+        print(f"Acurácia da referência (classe mais comum): {ac_base:.1%}")
+        print(f"Melhoria sobre referência: {(acuracia - ac_base):.1%}")
+        print(f"F1-score: {f1:.1%}")
+        print(f"AUC: {auc:.3f}")
+        print(f"Brier score: {brier:.3f}")
+        print(f"Precisão: {precisao:.1%}")
+        print(f"Recall: {recall:.1%}")
+        print()
+        print("Matriz de confusão (teste):")
+        print(f"  VP (chuva acertada):  {vp}")
+        print(f"  FP (falso alarme):    {fp}")
+        print(f"  FN (chuva perdida):   {fn}")
+        print(f"  VN (sem chuva acert.):{vn}")
+        print("=" * 50 + "\n")
 
-        inicio = max(0, len(y_teste) - 10)
+    return rede, resultado, (X_teste_n, y_teste, previsoes, probabilidades_teste, d_teste)
 
-        for i in range(inicio, len(y_teste)):
-            real = "Chuva" if y_teste[i, 0] == 1 else "Sem chuva"
-            previsto = "Chuva" if previsoes[i, 0] == 1 else "Sem chuva"
-            probabilidade = probabilidades[i, 0] * 100
 
-            print(
-                f"Real: {real:10} | "
-                f"Previsto: {previsto:10} | "
-                f"Probabilidade estimada de chuva: {probabilidade:.1f}%"
+def prever_proximo_dia(caminho_modelo='modelo.npz', caminho_dados='data'):
+    rede = RedeNeural.carregar(caminho_modelo)
+
+    if os.path.isdir(caminho_dados):
+        df = carregar_todas_cidades_da_pasta(caminho_dados, colunas_extra=rede.colunas_extra)
+    else:
+        df = carregar_dados(caminho_dados, colunas_extra=rede.colunas_extra)
+
+    df = engenharia_features_diaria(df)
+
+    # Usa as mesmas colunas do treino (salvas no modelo)
+    colunas_feature = rede.colunas_feature
+    janela_dias = rede.janela_dias if rede.janela_dias is not None else 3
+
+    if colunas_feature is None:
+        _, _, colunas_feature, _ = preparar_dados(df, janela_dias=janela_dias)
+    else:
+        # Verifica se todas as colunas existem no df
+        colunas_faltantes = [c for c in colunas_feature if c not in df.columns]
+        if colunas_faltantes:
+            raise ValueError(
+                f"Colunas do treino não encontradas nos dados: {colunas_faltantes}"
             )
+
+    matriz = df[colunas_feature].to_numpy(dtype=float)
+    datas = df.index
+
+    if len(matriz) < janela_dias:
+        raise ValueError(f"Não há dados suficientes (mínimo {janela_dias} dias).")
+
+    # Preenche NaN com forward fill e depois com média da coluna
+    matriz_df = pd.DataFrame(matriz, columns=colunas_feature, index=datas)
+    matriz_df = matriz_df.ffill().bfill()
+    for c in matriz_df.columns:
+        if matriz_df[c].isna().any():
+            matriz_df[c] = matriz_df[c].fillna(matriz_df[c].mean())
+
+    ultima_data = datas[-1]
+    janela = matriz_df.iloc[-janela_dias:].values.reshape(1, -1)
+
+    media = rede.media_treino
+    desvio = rede.desvio_treino
+    if media is None or desvio is None:
+        raise ValueError("O modelo não contém estatísticas de normalização.")
+
+    janela_n = (janela - media) / desvio
+
+    probabilidade = float(rede.prever(janela_n)[0][0])
+    threshold = rede.threshold_otimo
+    # Piso de seguranca: nao aceita threshold abaixo de 0.50
+    threshold = max(threshold, 0.50)
+    previsao_chuva = int(probabilidade >= threshold)
+
+    return {
+        'ultima_data_disponivel': str(ultima_data.date()),
+        'probabilidade_chuva': round(probabilidade, 4),
+        'probabilidade_percentual': round(probabilidade * 100, 2),
+        'previsao_chuva': previsao_chuva,
+        'previsao_texto': 'CHUVA' if previsao_chuva == 1 else 'SEM CHUVA',
+        'threshold_usado': round(threshold, 4),
+    }
+
+
+def main(verbose=True):
+    if len(sys.argv) < 2:
+        print("Uso: python main.py <caminho_csv_ou_pasta> [--prever] [colunas_extra...]")
+        print("Exemplo: python main.py data/")
+        print("Exemplo com previsão: python main.py data/ --prever")
+        sys.exit(1)
+
+    caminho = sys.argv[1]
+    modo_prever = False
+    colunas_extra = []
+
+    for arg in sys.argv[2:]:
+        if arg == '--prever':
+            modo_prever = True
+        else:
+            colunas_extra.append(arg)
+
+    if modo_prever:
+        resultado = prever_proximo_dia(
+            caminho_modelo='modelo.npz',
+            caminho_dados=caminho,
+        )
+        print("\n" + "=" * 50)
+        print("       PREVISÃO PARA O PRÓXIMO DIA")
+        print("=" * 50)
+        print(f"Última data disponível: {resultado['ultima_data_disponivel']}")
+        print(f"Probabilidade de chuva: {resultado['probabilidade_percentual']}%")
+        print(f"Previsão: {resultado['previsao_texto']}")
+        print(f"Threshold usado: {resultado['threshold_usado']}")
+        print("=" * 50 + "\n")
+        return
+
+    rede, resultado, _ = treinar_rede_completa(
+        caminho_dados=caminho,
+        colunas_extra=colunas_extra if colunas_extra else None,
+        verbose=verbose
+    )
+
+    # Previsão para o dia seguinte após o treino
+    try:
+        pred = prever_proximo_dia(
+            caminho_modelo='modelo.npz',
+            caminho_dados=caminho,
+        )
+        print("\n" + "=" * 50)
+        print("       PREVISÃO PARA O PRÓXIMO DIA")
+        print("=" * 50)
+        print(f"Última data disponível: {pred['ultima_data_disponivel']}")
+        print(f"Probabilidade de chuva: {pred['probabilidade_percentual']}%")
+        print(f"Previsão: {pred['previsao_texto']}")
+        print(f"Threshold usado: {pred['threshold_usado']}")
+        print("=" * 50 + "\n")
+    except Exception as e:
+        print(f"\nNão foi possível gerar previsão para o próximo dia: {e}\n")
 
 
 if __name__ == "__main__":
-    # Permite passar --quiet para suprimir a tabela de exemplos
     modo_verbose = True
-    if len(sys.argv) > 2 and sys.argv[2] == "--quiet":
+    if len(sys.argv) > 2 and sys.argv[-1] == "--quiet":
         modo_verbose = False
-    
+
     main(verbose=modo_verbose)
