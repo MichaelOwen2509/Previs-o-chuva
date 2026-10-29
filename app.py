@@ -1,9 +1,11 @@
 import os
 import numpy as np
+from pathlib import Path
 from flask import Flask, render_template, request, jsonify
 
 from main import (
     carregar_dados,
+    carregar_varias_cidades,
     preparar_dados,
     calcular_class_weight,
     encontrar_threshold_otimo,
@@ -16,28 +18,39 @@ app = Flask(__name__)
 DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
-def carregar_e_processar(caminho_arquivo):
-    """Reutiliza a lógica de processamento do main.py"""
-    chuva = carregar_dados(caminho_arquivo)
-    X, y = preparar_dados(chuva)
+COLUNAS_EXTRA_PADRAO = [
+    "TEMPERATURA",
+    "UMIDADE",
+    "PRESSAO",
+    "RADIACAO",
+    "VENTO",
+]
+
+
+def _treinar_e_avaliar(df, epocas=5000):
+    """Executa preparo, treino e avaliação em um DataFrame (uma ou várias cidades)."""
+    X, y, colunas_feature = preparar_dados(df)
 
     if len(X) < 30:
-        raise ValueError(f"Poucos exemplos disponíveis para treinar a rede. São necessários pelo menos 30 dias com dados completos. CSV tem apenas {len(X)} exemplos.")
+        raise ValueError(
+            f"Poucos exemplos disponíveis para treinar a rede. São necessários pelo menos 30 dias com dados completos. Atualmente há {len(X)} exemplos."
+        )
 
     X_treino, y_treino, X_teste, y_teste = dividir_treino_teste(X, y, proporcao_treino=0.8)
-    media = X_treino.mean()
-    desvio = X_treino.std()
-    if desvio == 0: desvio = 1
+
+    # Normaliza por coluna usando apenas treino.
+    media = X_treino.mean(axis=0)
+    desvio = X_treino.std(axis=0)
+    desvio = np.where(desvio == 0, 1, desvio)
     X_treino_n = (X_treino - media) / desvio
     X_teste_n = (X_teste - media) / desvio
 
-    rede = RedeNeural(entradas=3, ocultos=4, taxa_aprendizado=0.01)
+    n_entradas = X_treino_n.shape[1]
+    rede = RedeNeural(entradas=n_entradas, ocultos=8, taxa_aprendizado=0.01)
     class_weight = calcular_class_weight(y_treino)
-    rede.treinar(X_treino_n, y_treino, epocas=2000, class_weight=class_weight)
+    rede.treinar(X_treino_n, y_treino, epocas=epocas, class_weight=class_weight)
 
     probabilidades = rede.prever(X_teste_n)
-
-    # Calibra threshold para maximizar F1 na classe chuva (treino).
     probabilidades_treino = rede.prever(X_treino_n)
     threshold = encontrar_threshold_otimo(probabilidades_treino, y_treino)
     previsoes = (probabilidades >= threshold).astype(int)
@@ -52,10 +65,11 @@ def carregar_e_processar(caminho_arquivo):
     ac_base_score = float(np.mean(np.full_like(y_teste, classe_comum) == y_teste))
 
     return {
-        "arquivo": os.path.basename(caminho_arquivo),
         "total_exemplos": len(X),
         "treino": len(X_treino),
         "teste": len(X_teste),
+        "n_entradas": n_entradas,
+        "features": colunas_feature,
         "acuracia": round(acuracia, 4),
         "acuracia_base": round(ac_base_score, 4),
         "melhoria": round(acuracia - ac_base_score, 4),
@@ -70,6 +84,28 @@ def carregar_e_processar(caminho_arquivo):
         "threshold": round(float(threshold), 4),
         "class_weight_chuva": round(float(class_weight[1]), 4),
     }
+
+
+def carregar_e_processar(caminho_arquivo, colunas_extra=None):
+    """Processa um único CSV (compatível com o frontend existente)."""
+    if colunas_extra is None:
+        colunas_extra = COLUNAS_EXTRA_PADRAO
+
+    caminho = Path(caminho_arquivo)
+    if caminho.is_dir():
+        csvs = sorted(caminho.glob("*.csv"))
+        if not csvs:
+            raise ValueError(f"Nenhum CSV encontrado na pasta: {caminho}")
+        df = carregar_varias_cidades([str(c) for c in csvs], colunas_extra=colunas_extra)
+        resultado = _treinar_e_avaliar(df)
+        resultado["arquivo"] = "varias_cidades"
+        resultado["cidades"] = [Path(c).stem for c in csvs]
+        return resultado
+
+    df = carregar_dados(caminho, colunas_extra=colunas_extra)
+    resultado = _treinar_e_avaliar(df)
+    resultado["arquivo"] = os.path.basename(caminho_arquivo)
+    return resultado
 
 @app.route("/")
 def index():

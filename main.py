@@ -29,25 +29,60 @@ def detectar_encoding(caminho):
     return 'latin-1'
 
 
-def carregar_dados(caminho_arquivo):
+def _mapear_coluna(df, palavras):
+    """Encontra a primeira coluna que contenha alguma das palavras-chave."""
+    for col in df.columns:
+        for p in palavras:
+            if p in col:
+                return col
+    return None
+
+
+def _agregar_diario(df, coluna_data, coluna_chuva, colunas_extra=None):
+    """Agrega registros horários por dia, calculando media/soma das features."""
+    df = df.copy()
+    df[coluna_data] = pd.to_datetime(df[coluna_data], format="%Y/%m/%d", errors="coerce")
+    df = df.dropna(subset=[coluna_data])
+
+    df["chuva"] = pd.to_numeric(
+        df[coluna_chuva].astype(str).str.strip().str.replace(",", ".", regex=False),
+        errors="coerce"
+    )
+    df.loc[df["chuva"] < 0, "chuva"] = np.nan
+
+    agg = {"chuva": ("chuva", "sum"), "horas_validas": ("chuva", "count")}
+
+    if colunas_extra:
+        for nome_col in colunas_extra:
+            df[nome_col] = pd.to_numeric(
+                df[nome_col].astype(str).str.strip().str.replace(",", ".", regex=False),
+                errors="coerce"
+            )
+            agg[f"{nome_col}_media"] = (nome_col, "mean")
+            agg[f"{nome_col}_max"] = (nome_col, "max")
+            agg[f"{nome_col}_min"] = (nome_col, "min")
+
+    diario = df.groupby(df[coluna_data].dt.normalize()).agg(**agg)
+    diario = diario[diario["horas_validas"] == 24]
+    diario = diario.sort_index()
+    return diario
+
+
+def carregar_dados(caminho_arquivo, colunas_extra=None):
     """Carrega e processa dados meteorológicos de um CSV do INMET.
-    Detecta encoding automaticamente e mapeia colunas por palavras-chave,
-    funcionando com diferentes variações de nomes de coluna.
+    Retorna um DataFrame indexado por data com chuva_total e features opcionais.
+    Mantido para compatibilidade com app.py.
     """
     caminho = Path(caminho_arquivo)
     if not caminho.exists():
-        raise FileNotFoundError(
-            f"Arquivo não encontrado: {caminho_arquivo}"
-        )
+        raise FileNotFoundError(f"Arquivo não encontrado: {caminho_arquivo}")
 
     encoding = detectar_encoding(caminho)
 
-    # O INMET usa ";", mas arquivos salvos pelo Excel podem vir com ","
     with open(caminho, encoding=encoding, errors="replace") as f:
         cabecalho = next(itertools.islice(f, 8, None), "")
     separador = ";" if ";" in cabecalho else ","
 
-    # Padrão INMET: 8 linhas de metadados antes do cabeçalho
     df = pd.read_csv(
         caminho,
         sep=separador,
@@ -55,18 +90,10 @@ def carregar_dados(caminho_arquivo):
         encoding=encoding,
         low_memory=False
     )
-
-    # Normalizar nomes das colunas
     df.columns = [normalizar_coluna(c) for c in df.columns]
 
-    # Identificar coluna de data (contém 'DATA')
-    coluna_data = None
-    coluna_chuva = None
-    for col in df.columns:
-        if 'DATA' in col:
-            coluna_data = col
-        if 'PRECIP' in col or 'CHUVA' in col:
-            coluna_chuva = col
+    coluna_data = _mapear_coluna(df, ("DATA",))
+    coluna_chuva = _mapear_coluna(df, ("PRECIP", "CHUVA"))
 
     if coluna_data is None or coluna_chuva is None:
         raise ValueError(
@@ -75,57 +102,53 @@ def carregar_dados(caminho_arquivo):
             "Procuro por colunas que contenham 'DATA' (data) e 'PRECIP' ou 'CHUVA' (precipitação)."
         )
 
-    # Converte as datas para o formato que o Python entende.
-    df[coluna_data] = pd.to_datetime(
-        df[coluna_data],
-        format="%Y/%m/%d",
-        errors="coerce"
-    )
+    if colunas_extra is None:
+        colunas_extra = []
+    colunas_extra_encontradas = []
+    for palavra in colunas_extra:
+        col = _mapear_coluna(df, (palavra,))
+        if col is not None and col not in colunas_extra_encontradas:
+            colunas_extra_encontradas.append(col)
 
-    # Converte a precipitação para números.
-    # O INMET pode utilizar vírgula como separador decimal.
-    df["chuva"] = pd.to_numeric(
-        df[coluna_chuva]
-        .astype(str)
-        .str.strip()
-        .str.replace(",", ".", regex=False),
-        errors="coerce"
-    )
+    diario = _agregar_diario(df, coluna_data, coluna_chuva, colunas_extra_encontradas)
 
-    # Valores negativos ou ausentes não serão considerados válidos.
-    df.loc[df["chuva"] < 0, "chuva"] = np.nan
-    df = df.dropna(subset=[coluna_data])
-
-    # Agrupa os registros horários por dia.
-    diario = df.groupby(
-        df[coluna_data].dt.normalize()
-    ).agg(
-        chuva_total=("chuva", "sum"),
-        horas_validas=("chuva", "count")
-    )
-
-    # Só utiliza dias com as 24 horas preenchidas.
-    diario = diario[diario["horas_validas"] == 24]
-
-    chuva = diario["chuva_total"].sort_index()
-
-    if len(chuva) == 0:
+    if len(diario) == 0:
         raise ValueError("Nenhum dia com 24 registros válidos foi encontrado.")
 
     # Identifica sequências de dias consecutivos.
-    grupos = chuva.index.to_series().diff().dt.days.ne(1).cumsum()
-
-    # Escolhe a maior sequência sem interrupções.
-    tamanhos = chuva.groupby(grupos).size()
+    grupos = diario.index.to_series().diff().dt.days.ne(1).cumsum()
+    tamanhos = diario.groupby(grupos).size()
     maior_grupo = tamanhos.idxmax()
-    chuva = chuva[grupos == maior_grupo]
+    diario = diario[grupos == maior_grupo]
 
     print("\nDados meteorológicos preparados:")
-    print(f"Primeiro dia: {chuva.index.min().date()}")
-    print(f"Último dia:   {chuva.index.max().date()}")
-    print(f"Dias consecutivos completos: {len(chuva)}")
+    print(f"Primeiro dia: {diario.index.min().date()}")
+    print(f"Último dia:   {diario.index.max().date()}")
+    print(f"Dias consecutivos completos: {len(diario)}")
 
-    return chuva
+    return diario
+
+
+def carregar_varias_cidades(caminhos, colunas_extra=None):
+    """Carrega e agrega dados de múltiplos CSVs (várias cidades).
+
+    Cada arquivo vira uma 'cidade' identificada pelo nome do arquivo.
+    Os DataFrames são concatenados e ordenados por data.
+    """
+    frames = []
+    for caminho in caminhos:
+        diario = carregar_dados(caminho, colunas_extra=colunas_extra)
+        nome_cidade = Path(caminho).stem
+        diario = diario.copy()
+        diario["cidade"] = nome_cidade
+        frames.append(diario)
+
+    if not frames:
+        raise ValueError("Nenhum arquivo foi carregado.")
+
+    df = pd.concat(frames, axis=0)
+    df = df.sort_index()
+    return df
 
 
 def calcular_class_weight(y):
@@ -206,38 +229,94 @@ def dividir_treino_teste(X, y, proporcao_treino=0.8):
     return X[idx_treino], y[idx_treino].reshape(-1, 1), X[idx_teste], y[idx_teste].reshape(-1, 1)
 
 
-def preparar_dados(chuva):
-    valores = chuva.to_numpy(dtype=float)
+def preparar_dados(df, coluna_chuva=None, janela_dias=3):
+    """Converte um DataFrame diário em X (features dos N dias anteriores) e y (chuva hoje).
+
+    Se o DataFrame tiver coluna 'cidade', cada cidade é tratada como sequência
+    independente (não mistura o último dia de uma cidade com o primeiro da outra).
+
+    X tem formato (amostras, janela_dias * n_features).
+    """
+    df = df.sort_index()
+
+    if coluna_chuva is None:
+        # Detecta automaticamente a coluna de chuva agregada (case-insensitive).
+        for c in df.columns:
+            if "CHUVA" in c.upper():
+                coluna_chuva = c
+                break
+    if coluna_chuva is None:
+        raise ValueError("Nenhuma coluna de chuva encontrada no DataFrame.")
+
+    valores_chuva = df[coluna_chuva].to_numpy(dtype=float)
+
+    # Colunas de features (tudo que não seja a coluna de chuva, horas_validas ou cidade)
+    colunas_feature = [
+        c for c in df.columns
+        if c not in (coluna_chuva, "horas_validas", "cidade")
+    ]
+
+    n_features = len(colunas_feature)
+    if n_features == 0:
+        # Fallback: apenas chuva dos dias anteriores (comportamento original).
+        matriz = valores_chuva.reshape(-1, 1)
+        n_features = 1
+    else:
+        matriz = df[colunas_feature].to_numpy(dtype=float)
 
     X = []
     y = []
+    cidades = df["cidade"].to_numpy() if "cidade" in df.columns else None
 
-    # Utiliza os 3 dias anteriores para prever o dia seguinte.
-    for i in range(3, len(valores)):
-        dias_anteriores = valores[i - 3:i]
+    n = len(valores_chuva)
+    for i in range(janela_dias, n):
+        # Não ultrapassa fronteira de cidade (se houver).
+        if cidades is not None and cidades[i] != cidades[i - janela_dias]:
+            continue
 
-        # 1 = choveu; 0 = não choveu.
-        choveu = int(valores[i] > 0)
+        janela = matriz[i - janela_dias:i].reshape(-1)  # achata janela_dias x n_features
+        choveu = int(valores_chuva[i] > 0)
 
-        X.append(dias_anteriores)
+        X.append(janela)
         y.append(choveu)
 
     return (
         np.array(X, dtype=float),
-        np.array(y, dtype=float).reshape(-1, 1)
+        np.array(y, dtype=float).reshape(-1, 1),
+        colunas_feature,
     )
 
 
 def main(verbose=True):
     if len(sys.argv) < 2:
-        print("Uso: python main.py <caminho_do_arquivo_csv>")
-        print("Exemplo: python main.py data/inmet.csv")
+        print("Uso: python main.py <caminho_csv_ou_pasta> [colunas_extra...]")
+        print("Exemplo: python main.py data/")
+        print("Exemplo com features: python main.py data/ TEMPERATURA UMIDADE PRESSAO")
         sys.exit(1)
 
-    caminho_arquivo = sys.argv[1]
+    caminho = sys.argv[1]
+    colunas_extra = sys.argv[2:] if len(sys.argv) > 2 else []
 
-    chuva = carregar_dados(caminho_arquivo)
-    X, y = preparar_dados(chuva)
+    caminho = Path(caminho)
+
+    if caminho.is_dir():
+        csvs = sorted(caminho.glob("*.csv"))
+        if not csvs:
+            raise ValueError(f"Nenhum CSV encontrado na pasta: {caminho}")
+        caminhos = [str(c) for c in csvs]
+        print(f"\nCarregando {len(caminhos)} arquivo(s) CSV de: {caminho}")
+        df = carregar_varias_cidades(caminhos, colunas_extra=colunas_extra)
+    elif caminho.is_file():
+        print(f"\nCarregando 1 arquivo CSV: {caminho}")
+        df = carregar_dados(caminho, colunas_extra=colunas_extra)
+    else:
+        raise FileNotFoundError(f"Caminho não encontrado: {caminho}")
+
+    X, y, colunas_feature = preparar_dados(df)
+
+    n_entradas = X.shape[1]
+    print(f"Features utilizadas ({len(colunas_feature)}): {colunas_feature}")
+    print(f"Entradas da rede (janela x features): {n_entradas}")
 
     if len(X) < 30:
         raise ValueError(
@@ -247,20 +326,18 @@ def main(verbose=True):
     # Separa treino/teste garantindo representação de ambas as classes.
     X_treino, y_treino, X_teste, y_teste = dividir_treino_teste(X, y, proporcao_treino=0.8)
 
-    # Normaliza os valores usando apenas os dados de treinamento.
-    media = X_treino.mean()
-    desvio = X_treino.std()
-
-    if desvio == 0:
-        desvio = 1
+    # Normaliza por coluna usando apenas os dados de treinamento.
+    media = X_treino.mean(axis=0)
+    desvio = X_treino.std(axis=0)
+    desvio = np.where(desvio == 0, 1, desvio)
 
     X_treino = (X_treino - media) / desvio
     X_teste = (X_teste - media) / desvio
 
-    # Cria nossa rede neural.
+    # Cria nossa rede neural com o número correto de entradas.
     rede = RedeNeural(
-        entradas=3,
-        ocultos=4,
+        entradas=n_entradas,
+        ocultos=8,
         taxa_aprendizado=0.01
     )
 
@@ -273,7 +350,7 @@ def main(verbose=True):
     print(f"Pesos das classes (treino): sem chuva={class_weight[0]:.3f}, chuva={class_weight[1]:.3f}")
 
     print("\nIniciando treinamento...")
-    rede.treinar(X_treino, y_treino, epocas=2000, class_weight=class_weight)
+    rede.treinar(X_treino, y_treino, epocas=5000, class_weight=class_weight)
 
     # Faz previsões com os dados de teste.
     probabilidades = rede.prever(X_teste)
