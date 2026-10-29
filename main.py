@@ -154,23 +154,19 @@ def carregar_todas_cidades_da_pasta(pasta, colunas_extra=None, padrao="*.csv"):
     if not pasta.exists():
         raise FileNotFoundError(f"Pasta não encontrada: {pasta}")
 
-    arquivos = sorted(pasta.glob(padrao)) + sorted(pasta.glob(padrao.upper()))
-    
-    # Remove duplicatas por ano extraído do nome do arquivo
-    anos_vistos = set()
+    # Lista todos os .csv independente de maiúsculas/minúsculas da extensão
+    arquivos = sorted(
+        arq for arq in pasta.iterdir()
+        if arq.is_file() and arq.suffix.lower() == '.csv'
+    )
+
+    # Remove duplicatas com o mesmo nome de arquivo (ignorando caixa da extensão)
     arquivos_unicos = []
+    nomes_vistos = set()
     for arq in arquivos:
-        nome = Path(arq).stem
-        # Extrai ano do nome (formato: INMET_CO_DF_A001_BRASILIA_01-01-YYYY_A_...)
-        partes = nome.split('_')
-        ano = None
-        for p in partes:
-            if p.isdigit() and len(p) == 4 and 1900 <= int(p) <= 2100:
-                ano = p
-                break
-        chave = ano or nome.lower()
-        if chave not in anos_vistos:
-            anos_vistos.add(chave)
+        chave = arq.stem.lower()
+        if chave not in nomes_vistos:
+            nomes_vistos.add(chave)
             arquivos_unicos.append(str(arq))
 
     if not arquivos_unicos:
@@ -255,21 +251,37 @@ def engenharia_features_diaria(df, coluna_chuva=None):
     if coluna_chuva is None:
         raise ValueError("Nenhuma coluna de chuva/precipitação encontrada no DataFrame.")
 
-    # Preenche valores ausentes
+    # Segmentos contíguos: quebra quando falta dia (gap entre anos) ou muda a cidade.
+    # Rolling/diff ffill são feitos por segmento para não misturar anos distintos.
+    quebras = pd.Series(False, index=df.index)
+    dif_dias = df.index.to_series().diff().dt.days
+    quebras |= dif_dias.fillna(1).ne(1)
+    if 'cidade' in df.columns:
+        quebras |= df['cidade'] != df['cidade'].shift(1)
+    segmento = quebras.cumsum()
+
+    # Preenche valores ausentes apenas dentro do mesmo segmento
     colunas_numericas = df.select_dtypes(include=[np.number]).columns
-    df[colunas_numericas] = df[colunas_numericas].ffill().bfill()
+    for c in colunas_numericas:
+        df[c] = df.groupby(segmento)[c].ffill().bfill()
 
     # Chuva total diária
     df['chuva_total'] = df[coluna_chuva]
 
     # Features de chuva (as mais preditivas)
-    df['chuva_media_3d'] = df['chuva_total'].rolling(window=3, min_periods=1).mean()
-    df['chuva_media_7d'] = df['chuva_total'].rolling(window=7, min_periods=1).mean()
+    g_seg = df.groupby(segmento)
+    df['chuva_media_3d'] = g_seg['chuva_total'].transform(
+        lambda s: s.rolling(window=3, min_periods=1).mean()
+    )
+    df['chuva_media_7d'] = g_seg['chuva_total'].transform(
+        lambda s: s.rolling(window=7, min_periods=1).mean()
+    )
 
-    # Sequência de dias consecutivos sem chuva
+    # Sequência de dias consecutivos sem chuva (reinicia a cada segmento)
     df['dia_com_chuva'] = (df['chuva_total'] > 0).astype(int)
-    grupo = (df['dia_com_chuva'] != df['dia_com_chuva'].shift(1)).cumsum()
-    df['sequencia_dias_sem_chuva'] = df.groupby(grupo)['dia_com_chuva'].cumcount()
+    troca = (df['dia_com_chuva'] != df['dia_com_chuva'].shift(1)) | quebras
+    grupo = troca.cumsum()
+    df['sequencia_dias_sem_chuva'] = df.groupby(grupo).cumcount()
     df.loc[df['dia_com_chuva'] == 1, 'sequencia_dias_sem_chuva'] = 0
 
     # Sazonalidade (ciclo anual - fundamental para chuva em Brasília)
@@ -297,14 +309,14 @@ def engenharia_features_diaria(df, coluna_chuva=None):
     col_pressao = _mapear_coluna(df, ('PRESSAO ATMOSFERICA AO NIVEL',))
     if col_pressao is not None:
         df['pressao_media'] = df[col_pressao]
-        df['pressao_variacao'] = df[col_pressao].diff()
+        df['pressao_variacao'] = df.groupby(segmento)[col_pressao].diff()
 
     return df
 
 
 def preparar_dados(df, coluna_chuva=None, janela_dias=3):
-    df = engenharia_features_diaria(df, coluna_chuva=coluna_chuva)
-
+    # Observação: espera-se que engenharia_features_diaria já tenha sido aplicada
+    # pelo chamador (evita processar as features em duplicidade).
     if coluna_chuva is None:
         for c in df.columns:
             if c == 'chuva_total' or 'CHUVA' in c.upper():
@@ -390,7 +402,7 @@ def normalizar_treino_teste(X_treino, X_val, X_teste):
     return X_treino_n, X_val_n, X_teste_n, media, desvio
 
 
-def treinar_rede_completa(caminho_dados, epocas=5000, janela_dias=3,
+def treinar_rede_completa(caminho_dados, epocas=8000, janela_dias=3,
                           colunas_extra=None, proporcoes=(0.6, 0.2, 0.2),
                           salvar_modelo='modelo.npz', verbose=True):
     if os.path.isdir(caminho_dados):
@@ -440,7 +452,7 @@ def treinar_rede_completa(caminho_dados, epocas=5000, janela_dias=3,
 
     rede.treinar(
         X_treino_n, y_treino,
-        epocas=8000,
+        epocas=epocas,
         batch_size=128,
         X_val=X_val_n,
         y_val=y_val,
@@ -454,8 +466,10 @@ def treinar_rede_completa(caminho_dados, epocas=5000, janela_dias=3,
 
     probabilidades_val = rede.prever(X_val_n)
     threshold = encontrar_threshold_otimo(probabilidades_val, y_val)
-    # Piso forte: nunca aceita threshold abaixo de 0.5
-    rede.threshold_otimo = max(threshold, 0.50)
+    # Piso: nunca aceita threshold abaixo de 0.5 (usado igualmente em
+    # treino/avaliação e na previsão final, para não haver inconsistência)
+    threshold = max(threshold, 0.50)
+    rede.threshold_otimo = threshold
 
     probabilidades_teste = rede.prever(X_teste_n)
     previsoes = (probabilidades_teste >= threshold).astype(int)
