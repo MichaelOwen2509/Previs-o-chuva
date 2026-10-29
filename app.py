@@ -68,12 +68,27 @@ def analisar():
             if not os.path.exists(caminho):
                 return jsonify({"tipo": "erro", "mensagem": "Arquivo não encontrado. Ele pode ter sido excluído."}), 404
             try:
+                # Treina sempre com TODOS os CSVs da pasta data/ (arquivo único tem
+                # dados poucos e forte deslocamento sazonal treino/teste, o que
+                # invertia as previsões). O arquivo selecionado apenas dispara a análise.
+                arquivos_treino = [
+                    f for f in os.listdir(DATA_FOLDER) if f.lower().endswith(".csv")
+                ]
+                if not arquivos_treino:
+                    return jsonify({"tipo": "erro", "mensagem": "Nenhum arquivo CSV encontrado na pasta data/."}), 400
                 _, resultado, _ = treinar_rede_completa(
-                    caminho_dados=caminho,
+                    caminho_dados=DATA_FOLDER,
                     salvar_modelo='modelo.npz',
                     verbose=False
                 )
-                return jsonify({"tipo": "sucesso", "mensagem": "Análise concluída: " + nome, "resultado": _sanitize_json(resultado)})
+                return jsonify({
+                    "tipo": "sucesso",
+                    "mensagem": (
+                        "Análise concluída (treinada com todos os "
+                        f"{len(arquivos_treino)} arquivos de data/)."
+                    ),
+                    "resultado": _sanitize_json(resultado),
+                })
             except ValueError as ve:
                 return jsonify({"tipo": "erro", "mensagem": str(ve)}), 400
             except Exception as e:
@@ -103,27 +118,11 @@ def analisar():
 @app.route("/prever", methods=["POST", "GET"])
 def prever():
     try:
-        nome = None
-        if request.method == "POST":
-            nome = request.form.get("arquivo", "")
-        else:
-            nome = request.args.get("arquivo", "")
-
-        if not nome:
-            nome = DATA_FOLDER
-
-        # Garante caminho absoluto dentro de DATA_FOLDER
-        if not os.path.isabs(nome):
-            caminho_tentativo = os.path.join(DATA_FOLDER, nome)
-            if os.path.exists(caminho_tentativo):
-                nome = caminho_tentativo
-            else:
-                # Se nao existe, tenta direto o DATA_FOLDER (pasta com todos os CSVs)
-                nome = DATA_FOLDER
-
+        # O modelo é treinado com todos os CSVs de data/, então a previsão do
+        # próximo dia também usa a pasta inteira (última data disponível).
         resultado = prever_proximo_dia(
             caminho_modelo='modelo.npz',
-            caminho_dados=nome,
+            caminho_dados=DATA_FOLDER,
         )
         return jsonify({"tipo": "sucesso", "mensagem": "Previsão gerada", "resultado": _sanitize_json(resultado)})
     except FileNotFoundError as fe:
